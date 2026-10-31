@@ -1,0 +1,16 @@
+[package]
+name = "webbot-bpe"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "webbot_bpe"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.30.1", features = ["extension-module"] }
+rustc-hash = "2.1.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
