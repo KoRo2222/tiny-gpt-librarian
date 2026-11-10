@@ -215,7 +215,7 @@ def test_encode_chunks_matches_encode(backend):
 
 
 def test_safe_pieces_pretokenize_like_whole_text():
-    from webbot.tokenizer.bpe import _safe_pieces
+    from webbot.tokenizer.pretokenize import _safe_pieces
 
     tok = BPETokenizer()
     expected = tok._pretokenize(TRICKY_TEXT)
@@ -246,7 +246,7 @@ def test_parallel_training_matches_single_process(backend):
 
 
 def test_bundle_groups_small_pieces_without_losing_any():
-    from webbot.tokenizer.bpe import _bundle
+    from webbot.tokenizer.pretokenize import _bundle
 
     pieces = [f"話{i}" * (i % 5 + 1) for i in range(100)]
     bundles = list(_bundle(pieces, target_chars=60))  # 600 chars -> ~10 bundles

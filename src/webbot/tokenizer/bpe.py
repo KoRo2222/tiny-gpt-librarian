@@ -2,116 +2,17 @@ from __future__ import annotations
 
 import heapq
 import json
-import re
-from collections import Counter, deque
-from collections.abc import Iterable, Iterator
-from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
+
+from .base import Tokenizer
+from .pretokenize import count_pretokens
 
 try:  # native training / encoding (built from rust/ with maturin)
     import webbot_bpe as _native
 except ImportError:
     _native = None
-
-# Character classes for pre-tokenization. Japanese has no spaces between
-# words, so script boundaries (hiragana / katakana / kanji / punctuation)
-# stand in for word boundaries. "ー" belongs to both kana classes so that
-# long vowels stay attached ("すごーい", "ドラゴン").
-_LATIN = "A-Za-zＡ-Ｚａ-ｚ"
-_DIGIT = "0-9０-９"
-_HIRAGANA = "ぁ-ゖゝゞー"
-_KATAKANA = "ァ-ヺーヽヾｦ-ﾟ"
-_KANJI = "一-鿿㐀-䶿々〆"
-
-# GPT-2's pre-tokenization pattern, extended with Japanese script classes.
-_SPLIT_PATTERN = re.compile(
-    r"""'s|'t|'re|'ve|'m|'ll|'d"""
-    rf"""| ?[{_LATIN}]+| ?[{_DIGIT}]+"""
-    rf"""| ?[{_HIRAGANA}]+| ?[{_KATAKANA}]+| ?[{_KANJI}]+"""
-    rf"""| ?[^\s{_LATIN}{_DIGIT}{_HIRAGANA}{_KATAKANA}{_KANJI}]+"""
-    r"""|\s+(?!\S)|\s+"""
-)
-
-_CLASS_PATTERNS = [
-    re.compile(f"[{cls}]") for cls in (_LATIN, _DIGIT, _HIRAGANA, _KATAKANA, _KANJI)
-]
-_SPACE = re.compile(r"\s")
-
-
-def _char_classes(c: str) -> frozenset[int]:
-    """Indices of the pretokenizer character classes c belongs to (5 = the
-    catch-all symbol class). "ー" belongs to two."""
-    found = frozenset(i for i, p in enumerate(_CLASS_PATTERNS) if p.match(c))
-    return found or frozenset((len(_CLASS_PATTERNS),))
-
-
-def _is_safe_split(text: str, i: int) -> bool:
-    """True if pretokenizing text[:i] and text[i:] separately gives exactly
-    the pretokens of text.
-
-    The pattern has no lookbehind, so matching from i is unaffected by what
-    precedes it; it only has to be guaranteed that a pretoken boundary falls
-    at i. That holds when both neighbours are non-space and share no
-    character class (so no run can span them), except after "'", where a
-    contraction such as "'ll" may be in progress.
-    """
-    a, b = text[i - 1], text[i]
-    if a == "'" or _SPACE.match(a) or _SPACE.match(b):
-        return False
-    return not (_char_classes(a) & _char_classes(b))
-
-
-def _safe_pieces(chunks: Iterable[str], target_chars: int) -> Iterator[str]:
-    """Regroup one document's chunks into pieces of about target_chars that
-    can be pretokenized independently (split only at _is_safe_split points).
-    A piece grows past target_chars when no safe point is found."""
-    buf = ""
-    scan_from = target_chars  # cut at the first safe point at or after this
-    for chunk in chunks:
-        buf += chunk
-        while len(buf) > scan_from:
-            cut = next(
-                (
-                    i
-                    for i in range(max(scan_from, 1), len(buf))
-                    if _is_safe_split(buf, i)
-                ),
-                None,
-            )
-            if cut is None:
-                # Wait for more text; don't rescan what was already checked.
-                scan_from = len(buf)
-                break
-            yield buf[:cut]
-            buf = buf[cut:]
-            scan_from = target_chars
-    if buf:
-        yield buf
-
-
-def _count_pretokens(texts: list[str]) -> Counter[str]:
-    """Worker task for parallel training (module-level so it can be pickled).
-    Each text is pretokenized on its own: they are independent pieces."""
-    counts: Counter[str] = Counter()
-    for text in texts:
-        counts.update(_SPLIT_PATTERN.findall(text))
-    return counts
-
-
-def _bundle(pieces: Iterable[str], target_chars: int) -> Iterator[list[str]]:
-    """Group pieces into lists of about target_chars, so a corpus of many
-    short documents is sent to workers in a few large tasks rather than
-    one task (and one round of pickling) per document."""
-    bundle: list[str] = []
-    size = 0
-    for piece in pieces:
-        bundle.append(piece)
-        size += len(piece)
-        if size >= target_chars:
-            yield bundle
-            bundle, size = [], 0
-    if bundle:
-        yield bundle
 
 
 def _bytes_to_unicode() -> dict[int, str]:
@@ -149,7 +50,7 @@ class _Desc:
         return self.pair > other.pair
 
 
-class BPETokenizer:
+class BPETokenizer(Tokenizer):
     """Byte-level BPE tokenizer, trained from scratch (GPT-2 style).
 
     backend selects how merges are learned and applied: "rust" uses the
@@ -158,30 +59,8 @@ class BPETokenizer:
     Both give identical merges and ids.
     """
 
-    # Document-boundary marker for pretraining data, also ends an answer.
-    EOT_TOKEN = "<|endoftext|>"
-    PAD_TOKEN = "<|pad|>"
-
-    # Special tokens get ids right after the learned merges, in this order.
-    # They are never produced by BPE merges; encode() emits them only when
-    # explicitly allowed, so the same strings inside ordinary text (e.g. a
-    # Wikipedia article) are encoded as plain text. Retrieval-QA layout:
-    #   <|question|>Q<|search|>query<|/search|><|doc|>P1<|/doc|>...<|answer|>A<|endoftext|>
-    SPECIAL_TOKENS = (
-        EOT_TOKEN,
-        PAD_TOKEN,  # batch padding; never a training target
-        "<|question|>",  # the user's question follows
-        "<|search|>",  # the model writes a search query ...
-        "<|/search|>",  # ... and ends it here (retrieval runs)
-        "<|doc|>",  # one retrieved paragraph follows ...
-        "<|/doc|>",  # ... and ends here
-        "<|answer|>",  # the answer follows, ended by EOT
-    )
-
-    # Pretokens sent to the native encoder per call in encode_chunks.
-    _NATIVE_BATCH = 4096
-
     def __init__(self, backend: str = "auto") -> None:
+        super().__init__()
         if backend not in ("auto", "rust", "python"):
             raise ValueError(f"unknown backend {backend!r}")
         if backend == "rust" and _native is None:
@@ -194,8 +73,6 @@ class BPETokenizer:
         self.ranks: dict[tuple[str, str], int] = {}
         self.vocab: dict[str, int] = {}
         self.inverse_vocab: dict[int, str] = {}
-        self.special_tokens: dict[str, int] = {}
-        self._special_ids: dict[int, str] = {}
 
     @property
     def _use_native(self) -> bool:
@@ -210,34 +87,6 @@ class BPETokenizer:
                 ]
             )
         return self._encoder
-
-    def _pretokenize(self, text: str) -> list[str]:
-        return _SPLIT_PATTERN.findall(text)
-
-    @staticmethod
-    def _pretokenize_chunks(chunks: Iterable[str]) -> Iterator[str]:
-        """Pretokenize one document given as consecutive text chunks.
-
-        Yields exactly what _pretokenize("".join(chunks)) would, without ever
-        holding the whole document. The last two matches of each buffer are
-        held back and re-matched with the next chunk: only they can change
-        once more text arrives (a match that ends at the buffer edge may keep
-        growing, and a contraction like "'ll" cut to "'l" shows up as two
-        short matches). Every earlier match starts at least 3 chars before
-        the edge, so its alternatives and lookahead see the same text either
-        way.
-        """
-        buf = ""
-        for chunk in chunks:
-            buf += chunk
-            held: deque[re.Match[str]] = deque()
-            for m in _SPLIT_PATTERN.finditer(buf):
-                held.append(m)
-                if len(held) > 2:
-                    yield held.popleft().group()
-            if held:
-                buf = buf[held[0].start():]
-        yield from _SPLIT_PATTERN.findall(buf)
 
     def _to_byte_symbols(self, token: str) -> tuple[str, ...]:
         return tuple(self.byte_encoder[b] for b in token.encode("utf-8"))
@@ -267,29 +116,6 @@ class BPETokenizer:
                 i += 1
         return tuple(new_word)
 
-    @staticmethod
-    def _count_parallel(
-        docs: Iterable[Iterable[str]], num_workers: int, piece_chars: int
-    ) -> Counter[str]:
-        pieces = (
-            piece for chunks in docs for piece in _safe_pieces(chunks, piece_chars)
-        )
-        token_freqs: Counter[str] = Counter()
-        # Keep at most 2 bundles per worker in flight so a large corpus is
-        # never queued into memory ahead of the workers.
-        max_pending = 2 * num_workers
-        with ProcessPoolExecutor(max_workers=num_workers) as pool:
-            pending: set[Future[Counter[str]]] = set()
-            for bundle in _bundle(pieces, piece_chars):
-                pending.add(pool.submit(_count_pretokens, bundle))
-                if len(pending) >= max_pending:
-                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                    for f in done:
-                        token_freqs.update(f.result())
-            for f in pending:
-                token_freqs.update(f.result())
-        return token_freqs
-
     def train(
         self,
         texts: Iterable[str | Iterable[str]],
@@ -298,16 +124,9 @@ class BPETokenizer:
         num_workers: int = 1,
         piece_chars: int = 1 << 20,
     ) -> None:
-        """Learn merges from documents.
-
-        Each document is either a str or an iterable of str chunks (e.g. a
-        large file read piece by piece), and texts itself may be a generator,
-        so the corpus is streamed: only the counts of distinct pretokens are
-        kept in memory, never the corpus text.
-
-        With num_workers > 1, pretokenizing and counting run in worker
-        processes on pieces of about piece_chars characters. The learned
-        merges are identical to the single-process result.
+        """Learn merges from documents (see count_pretokens for how texts,
+        num_workers and piece_chars are handled; the learned merges do not
+        depend on num_workers).
 
         vocab_size is the size of the final vocab, special tokens included:
         256 byte symbols + merges + SPECIAL_TOKENS.
@@ -317,13 +136,7 @@ class BPETokenizer:
         if vocab_size < min_size:
             raise ValueError(f"vocab_size must be >= {min_size}")
 
-        docs = ((doc,) if isinstance(doc, str) else doc for doc in texts)
-        if num_workers > 1:
-            token_freqs = self._count_parallel(docs, num_workers, piece_chars)
-        else:
-            token_freqs = Counter()
-            for chunks in docs:
-                token_freqs.update(self._pretokenize_chunks(chunks))
+        token_freqs = count_pretokens(texts, num_workers, piece_chars)
 
         num_merges = vocab_size - min_size
         if self._use_native:
@@ -425,21 +238,8 @@ class BPETokenizer:
             # merge can ever produce a whole special token.
             assert token not in self.vocab, token
             self.vocab[token] = len(self.vocab)
-        self._set_special_tokens(self.SPECIAL_TOKENS)
+        self._set_special_tokens({t: self.vocab[t] for t in self.SPECIAL_TOKENS})
         self.inverse_vocab = {i: sym for sym, i in self.vocab.items()}
-
-    def _set_special_tokens(self, tokens: Iterable[str]) -> None:
-        self.special_tokens = {t: self.vocab[t] for t in tokens}
-        self._special_ids = {i: t for t, i in self.special_tokens.items()}
-
-    def _allowed_set(self, allowed_special: Iterable[str] | str) -> set[str]:
-        if allowed_special == "all":
-            return set(self.special_tokens)
-        allowed = set(allowed_special)
-        unknown = allowed - self.special_tokens.keys()
-        if unknown:
-            raise ValueError(f"not special tokens: {sorted(unknown)}")
-        return allowed
 
     def _bpe_word(self, word: tuple[str, ...]) -> tuple[str, ...]:
         while len(word) > 1:
@@ -450,85 +250,20 @@ class BPETokenizer:
             word = self._merge_word(word, candidate, "".join(candidate))
         return word
 
-    def encode(
-        self, text: str, allowed_special: Iterable[str] | str = ()
-    ) -> list[int]:
-        """Encode text to ids.
+    def __len__(self) -> int:
+        return len(self.vocab)
 
-        Occurrences of the special tokens listed in allowed_special (or of
-        every special token, with "all") become their special ids; the text
-        between them is encoded on its own. Special-token strings that are
-        not allowed are encoded as ordinary text.
-        """
-        allowed = self._allowed_set(allowed_special)
-        if not allowed:
-            return self._encode_ordinary(text)
-        # Longest first, so a token that is a prefix of another can't win.
-        pattern = "(" + "|".join(
-            re.escape(t) for t in sorted(allowed, key=len, reverse=True)
-        ) + ")"
-        ids: list[int] = []
-        for i, part in enumerate(re.split(pattern, text)):
-            if i % 2:  # captured separator = a special token
-                ids.append(self.special_tokens[part])
-            elif part:
-                ids.extend(self._encode_ordinary(part))
-        return ids
-
-    def _encode_ordinary(self, text: str) -> list[int]:
+    def _encode_pretokens(self, pretokens: list[str]) -> list[int]:
         if self._use_native:
-            return self._native_encoder().encode_words(self._pretokenize(text))
+            return self._native_encoder().encode_words(pretokens)
         ids = []
-        for token in self._pretokenize(text):
-            word = self._to_byte_symbols(token)
-            for symbol in self._bpe_word(word):
+        for token in pretokens:
+            for symbol in self._bpe_word(self._to_byte_symbols(token)):
                 ids.append(self.vocab[symbol])
         return ids
 
-    def encode_chunks(self, chunks: Iterable[str]) -> Iterator[int]:
-        """Lazily encode one document given as consecutive text chunks.
-
-        Same ids as encode("".join(chunks)), without materializing the text
-        or the full id list; callers can write ids out as they arrive.
-        """
-        if self._use_native:
-            encoder = self._native_encoder()
-            batch: list[str] = []
-            for token in self._pretokenize_chunks(chunks):
-                batch.append(token)
-                if len(batch) >= self._NATIVE_BATCH:
-                    yield from encoder.encode_words(batch)
-                    batch = []
-            yield from encoder.encode_words(batch)
-            return
-        for token in self._pretokenize_chunks(chunks):
-            for symbol in self._bpe_word(self._to_byte_symbols(token)):
-                yield self.vocab[symbol]
-
-    def encode_with_eot(self, texts: list[str]) -> list[int]:
-        """Encode multiple documents into one id stream, EOT-separated.
-
-        This is the shape pretraining needs: a flat sequence of token ids
-        with an explicit boundary marker between otherwise-unrelated
-        documents, so the model learns "this is the end" rather than
-        blending the tail of one snippet into the head of the next.
-        """
-        eot_id = self.special_tokens[self.EOT_TOKEN]
-        ids: list[int] = []
-        for text in texts:
-            ids.extend(self.encode(text))
-            ids.append(eot_id)
-        return ids
-
-    def decode(self, ids: list[int]) -> str:
-        byte_seq = bytearray()
-        for i in ids:
-            special = self._special_ids.get(i)
-            if special is not None:
-                byte_seq.extend(special.encode("utf-8"))
-            else:
-                byte_seq.extend(self.byte_decoder[ch] for ch in self.inverse_vocab[i])
-        return byte_seq.decode("utf-8", errors="replace")
+    def _token_bytes(self, token_id: int) -> bytes:
+        return bytes(self.byte_decoder[ch] for ch in self.inverse_vocab[token_id])
 
     def save(self, path: str | Path) -> None:
         data = {
@@ -549,5 +284,7 @@ class BPETokenizer:
         tok.vocab = data["vocab"]
         tok.inverse_vocab = {i: sym for sym, i in tok.vocab.items()}
         # Files written before special tokens were saved have only EOT.
-        tok._set_special_tokens(data.get("special_tokens", [tok.EOT_TOKEN]))
+        tok._set_special_tokens(
+            {t: tok.vocab[t] for t in data.get("special_tokens", [tok.EOT_TOKEN])}
+        )
         return tok
