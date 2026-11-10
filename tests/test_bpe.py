@@ -22,8 +22,11 @@ CORPUS = [
 def test_vocab_size_matches_request(backend):
     tok = BPETokenizer(backend)
     tok.train(CORPUS, vocab_size=280)
-    # +1 for the <|endoftext|> special token appended after BPE training.
-    assert len(tok.vocab) == 281
+    # vocab_size counts everything: bytes + merges + special tokens, with
+    # ids 0..279 and no gaps.
+    assert len(tok.vocab) == 280
+    assert sorted(tok.vocab.values()) == list(range(280))
+    assert len(tok.merges) == 280 - 256 - len(BPETokenizer.SPECIAL_TOKENS)
 
 
 def test_eot_inserted_between_documents(backend):
@@ -135,7 +138,7 @@ def _reference_merges(tok, texts, vocab_size):
             word = tok._to_byte_symbols(token)
             word_freqs[word] = word_freqs.get(word, 0) + 1
     merges = []
-    for _ in range(vocab_size - 256):
+    for _ in range(vocab_size - 256 - len(BPETokenizer.SPECIAL_TOKENS)):
         counts = tok._get_pair_counts(word_freqs)
         if not counts:
             break
@@ -269,7 +272,7 @@ def test_count_ties_break_on_symbol_strings_not_byte_values(backend):
     # printable stand-in for the space byte, U+0120) > "a", although the raw
     # byte 0x20 < 0x61.
     tok = BPETokenizer(backend)
-    tok.train(["ab", " b"], vocab_size=257)
+    tok.train(["ab", " b"], vocab_size=256 + len(tok.SPECIAL_TOKENS) + 1)
     assert tok.merges == [("Ġ", "b")]
 
 
@@ -330,3 +333,97 @@ def test_rust_encoder_cache_eviction_keeps_results():
     expected = [i for w in words for i in tok.encode(w)]
     assert tiny.encode_words(words) == expected
     assert tiny.encode_words(words) == expected
+
+
+QA_TEXT = (
+    "<|question|>王様の城はどこ？<|search|>王様 城<|/search|>"
+    "<|doc|>王様の城は丘の上にあります。<|/doc|><|doc|>城には塔が3つ。<|/doc|>"
+    "<|answer|>丘の上<|endoftext|>"
+)
+
+
+def _reference_encode_special(tok, text, allowed):
+    """Naive reference: scan for the earliest allowed special token with
+    str.find, encode the plain text before it, emit the special id, repeat."""
+    ids = []
+    while True:
+        hits = [(text.find(t), -len(t), t) for t in allowed if t in text]
+        if not hits:
+            return ids + (tok.encode(text) if text else [])
+        pos, _, token = min(hits)  # earliest; longest on a tie
+        if pos:
+            ids += tok.encode(text[:pos])
+        ids.append(tok.special_tokens[token])
+        text = text[pos + len(token):]
+
+
+def test_special_tokens_get_ids_right_after_merges(backend):
+    tok = BPETokenizer(backend)
+    tok.train(JA_CORPUS, vocab_size=400)
+    first = 256 + len(tok.merges)
+    assert tok.special_tokens == {
+        t: first + i for i, t in enumerate(BPETokenizer.SPECIAL_TOKENS)
+    }
+    assert tok.special_tokens[tok.EOT_TOKEN] == first  # same slot as before
+    for t, i in tok.special_tokens.items():
+        assert tok.decode([i]) == t
+
+
+def test_special_token_strings_are_plain_text_by_default(backend):
+    tok = BPETokenizer(backend)
+    tok.train(JA_CORPUS + [QA_TEXT], vocab_size=400)
+    ids = tok.encode(QA_TEXT)
+    assert not set(ids) & set(tok.special_tokens.values())
+    assert tok.decode(ids) == QA_TEXT
+    assert list(tok.encode_chunks(_split(QA_TEXT, 5))) == ids
+
+
+def test_allowed_special_tokens_become_single_ids(backend):
+    tok = BPETokenizer(backend)
+    tok.train(JA_CORPUS, vocab_size=400)
+    ids = tok.encode(QA_TEXT, allowed_special="all")
+    assert ids == _reference_encode_special(tok, QA_TEXT, tok.special_tokens)
+    sp = tok.special_tokens
+    assert ids[0] == sp["<|question|>"] and ids[-1] == sp[tok.EOT_TOKEN]
+    assert ids.count(sp["<|doc|>"]) == 2 and ids.count(sp["<|/doc|>"]) == 2
+    assert tok.decode(ids) == QA_TEXT
+
+
+def test_only_listed_special_tokens_are_allowed(backend):
+    tok = BPETokenizer(backend)
+    tok.train(JA_CORPUS, vocab_size=400)
+    allowed = {"<|doc|>", "<|/doc|>"}
+    ids = tok.encode(QA_TEXT, allowed_special=allowed)
+    assert ids == _reference_encode_special(tok, QA_TEXT, allowed)
+    emitted = set(ids) & set(tok.special_tokens.values())
+    assert emitted == {tok.special_tokens[t] for t in allowed}
+    assert tok.decode(ids) == QA_TEXT
+    with pytest.raises(ValueError):
+        tok.encode(QA_TEXT, allowed_special={"<|nope|>"})
+
+
+def test_special_tokens_survive_save_and_load(backend, tmp_path):
+    tok = BPETokenizer(backend)
+    tok.train(JA_CORPUS, vocab_size=400)
+    tok.save(tmp_path / "tok.json")
+    loaded = BPETokenizer.load(tmp_path / "tok.json", backend)
+    assert loaded.special_tokens == tok.special_tokens
+    assert loaded.encode(QA_TEXT, allowed_special="all") == tok.encode(
+        QA_TEXT, allowed_special="all"
+    )
+
+
+def test_old_tokenizer_file_without_special_list_loads_with_eot_only(backend, tmp_path):
+    import json
+
+    tok = BPETokenizer(backend)
+    tok.train(JA_CORPUS, vocab_size=300)
+    # The format saved before special tokens existed: EOT right after merges.
+    vocab = {s: i for s, i in tok.vocab.items() if i < 256 + len(tok.merges)}
+    vocab[tok.EOT_TOKEN] = len(vocab)
+    (tmp_path / "old.json").write_text(
+        json.dumps({"merges": tok.merges, "vocab": vocab}), encoding="utf-8"
+    )
+    old = BPETokenizer.load(tmp_path / "old.json", backend)
+    assert old.special_tokens == {tok.EOT_TOKEN: 256 + len(tok.merges)}
+    assert old.encode_with_eot(JA_CORPUS) == tok.encode_with_eot(JA_CORPUS)

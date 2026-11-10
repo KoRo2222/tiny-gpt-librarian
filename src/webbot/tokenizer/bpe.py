@@ -158,9 +158,25 @@ class BPETokenizer:
     Both give identical merges and ids.
     """
 
-    # Document-boundary marker for pretraining data (never produced by BPE
-    # merges themselves; only inserted explicitly via encode_with_eot).
+    # Document-boundary marker for pretraining data, also ends an answer.
     EOT_TOKEN = "<|endoftext|>"
+    PAD_TOKEN = "<|pad|>"
+
+    # Special tokens get ids right after the learned merges, in this order.
+    # They are never produced by BPE merges; encode() emits them only when
+    # explicitly allowed, so the same strings inside ordinary text (e.g. a
+    # Wikipedia article) are encoded as plain text. Retrieval-QA layout:
+    #   <|question|>Q<|search|>query<|/search|><|doc|>P1<|/doc|>...<|answer|>A<|endoftext|>
+    SPECIAL_TOKENS = (
+        EOT_TOKEN,
+        PAD_TOKEN,  # batch padding; never a training target
+        "<|question|>",  # the user's question follows
+        "<|search|>",  # the model writes a search query ...
+        "<|/search|>",  # ... and ends it here (retrieval runs)
+        "<|doc|>",  # one retrieved paragraph follows ...
+        "<|/doc|>",  # ... and ends here
+        "<|answer|>",  # the answer follows, ended by EOT
+    )
 
     # Pretokens sent to the native encoder per call in encode_chunks.
     _NATIVE_BATCH = 4096
@@ -179,6 +195,7 @@ class BPETokenizer:
         self.vocab: dict[str, int] = {}
         self.inverse_vocab: dict[int, str] = {}
         self.special_tokens: dict[str, int] = {}
+        self._special_ids: dict[int, str] = {}
 
     @property
     def _use_native(self) -> bool:
@@ -291,10 +308,14 @@ class BPETokenizer:
         With num_workers > 1, pretokenizing and counting run in worker
         processes on pieces of about piece_chars characters. The learned
         merges are identical to the single-process result.
+
+        vocab_size is the size of the final vocab, special tokens included:
+        256 byte symbols + merges + SPECIAL_TOKENS.
         """
         base_symbols = [self.byte_encoder[b] for b in range(256)]
-        if vocab_size < len(base_symbols):
-            raise ValueError(f"vocab_size must be >= {len(base_symbols)}")
+        min_size = len(base_symbols) + len(self.SPECIAL_TOKENS)
+        if vocab_size < min_size:
+            raise ValueError(f"vocab_size must be >= {min_size}")
 
         docs = ((doc,) if isinstance(doc, str) else doc for doc in texts)
         if num_workers > 1:
@@ -304,7 +325,7 @@ class BPETokenizer:
             for chunks in docs:
                 token_freqs.update(self._pretokenize_chunks(chunks))
 
-        num_merges = vocab_size - len(base_symbols)
+        num_merges = vocab_size - min_size
         if self._use_native:
             learned = _native.train_bpe(
                 list(token_freqs.items()), base_symbols, num_merges
@@ -399,9 +420,26 @@ class BPETokenizer:
         self.vocab = {sym: i for i, sym in enumerate(base_symbols)}
         for a, b in self.merges:
             self.vocab["".join((a, b))] = len(self.vocab)
-        self.vocab[self.EOT_TOKEN] = len(self.vocab)
-        self.special_tokens = {self.EOT_TOKEN: self.vocab[self.EOT_TOKEN]}
+        for token in self.SPECIAL_TOKENS:
+            # Pretokenization splits "<|", the name and "|>" apart, so no
+            # merge can ever produce a whole special token.
+            assert token not in self.vocab, token
+            self.vocab[token] = len(self.vocab)
+        self._set_special_tokens(self.SPECIAL_TOKENS)
         self.inverse_vocab = {i: sym for sym, i in self.vocab.items()}
+
+    def _set_special_tokens(self, tokens: Iterable[str]) -> None:
+        self.special_tokens = {t: self.vocab[t] for t in tokens}
+        self._special_ids = {i: t for t, i in self.special_tokens.items()}
+
+    def _allowed_set(self, allowed_special: Iterable[str] | str) -> set[str]:
+        if allowed_special == "all":
+            return set(self.special_tokens)
+        allowed = set(allowed_special)
+        unknown = allowed - self.special_tokens.keys()
+        if unknown:
+            raise ValueError(f"not special tokens: {sorted(unknown)}")
+        return allowed
 
     def _bpe_word(self, word: tuple[str, ...]) -> tuple[str, ...]:
         while len(word) > 1:
@@ -412,7 +450,32 @@ class BPETokenizer:
             word = self._merge_word(word, candidate, "".join(candidate))
         return word
 
-    def encode(self, text: str) -> list[int]:
+    def encode(
+        self, text: str, allowed_special: Iterable[str] | str = ()
+    ) -> list[int]:
+        """Encode text to ids.
+
+        Occurrences of the special tokens listed in allowed_special (or of
+        every special token, with "all") become their special ids; the text
+        between them is encoded on its own. Special-token strings that are
+        not allowed are encoded as ordinary text.
+        """
+        allowed = self._allowed_set(allowed_special)
+        if not allowed:
+            return self._encode_ordinary(text)
+        # Longest first, so a token that is a prefix of another can't win.
+        pattern = "(" + "|".join(
+            re.escape(t) for t in sorted(allowed, key=len, reverse=True)
+        ) + ")"
+        ids: list[int] = []
+        for i, part in enumerate(re.split(pattern, text)):
+            if i % 2:  # captured separator = a special token
+                ids.append(self.special_tokens[part])
+            elif part:
+                ids.extend(self._encode_ordinary(part))
+        return ids
+
+    def _encode_ordinary(self, text: str) -> list[int]:
         if self._use_native:
             return self._native_encoder().encode_words(self._pretokenize(text))
         ids = []
@@ -458,16 +521,20 @@ class BPETokenizer:
         return ids
 
     def decode(self, ids: list[int]) -> str:
-        symbols = [self.inverse_vocab[i] for i in ids]
         byte_seq = bytearray()
-        for symbol in symbols:
-            byte_seq.extend(self.byte_decoder[ch] for ch in symbol)
+        for i in ids:
+            special = self._special_ids.get(i)
+            if special is not None:
+                byte_seq.extend(special.encode("utf-8"))
+            else:
+                byte_seq.extend(self.byte_decoder[ch] for ch in self.inverse_vocab[i])
         return byte_seq.decode("utf-8", errors="replace")
 
     def save(self, path: str | Path) -> None:
         data = {
             "merges": [list(pair) for pair in self.merges],
             "vocab": self.vocab,
+            "special_tokens": list(self.special_tokens),
         }
         Path(path).write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -481,5 +548,6 @@ class BPETokenizer:
         tok.ranks = {pair: i for i, pair in enumerate(tok.merges)}
         tok.vocab = data["vocab"]
         tok.inverse_vocab = {i: sym for sym, i in tok.vocab.items()}
-        tok.special_tokens = {tok.EOT_TOKEN: tok.vocab[tok.EOT_TOKEN]}
+        # Files written before special tokens were saved have only EOT.
+        tok._set_special_tokens(data.get("special_tokens", [tok.EOT_TOKEN]))
         return tok
