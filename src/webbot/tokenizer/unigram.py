@@ -20,7 +20,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .base import Tokenizer
-from .pretokenize import count_pretokens
+from .pretokenize import count_pretokens, required_chars
 
 # A byte-fallback character scores this much below the least likely piece
 # (SentencePiece's kUnkPenalty).
@@ -214,23 +214,6 @@ def prune(words: list[tuple[str, int]], pieces: Pieces, size: int) -> Pieces:
             break
         kept[p] = pieces[p]
     return kept
-
-
-def required_chars(word_freqs: Counter[str], coverage: float) -> list[str]:
-    """The most frequent characters that together make up at least
-    `coverage` of all character occurrences (the rest use byte fallback)."""
-    char_freq: Counter[str] = Counter()
-    for word, f in word_freqs.items():
-        for ch in word:
-            char_freq[ch] += f
-    total = sum(char_freq.values())
-    chars, covered = [], 0
-    for ch, f in sorted(char_freq.items(), key=lambda kv: (-kv[1], kv[0])):
-        if covered >= coverage * total:
-            break
-        chars.append(ch)
-        covered += f
-    return chars
 
 
 def seed_pieces(
