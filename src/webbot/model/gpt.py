@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from .attention import CausalSelfAttention, KVCache
+from .rmsnorm import RMSNorm
+from .rope import RotaryEmbedding
+from .swiglu import SwiGLU
+
+
+@dataclass
+class GPTConfig:
+    vocab_size: int
+    max_seq_len: int = 512
+    d_model: int = 256
+    n_layers: int = 6
+    n_heads: int = 8
+    ffn_hidden_dim: int | None = None  # None -> SwiGLU default (~8/3 * d_model)
+    rope_base: float = 10000.0
+    attn_impl: str = "naive"  # "naive" or "flash" (see CausalSelfAttention)
+
+
+class Block(nn.Module):
+    """Pre-norm Transformer block: x + Attn(Norm(x)), then x + FFN(Norm(x))."""
+
+    def __init__(self, config: GPTConfig, rope: RotaryEmbedding):
+        super().__init__()
+        self.attn_norm = RMSNorm(config.d_model)
+        self.attn = CausalSelfAttention(
+            config.d_model, config.n_heads, rope, config.attn_impl
+        )
+        self.ffn_norm = RMSNorm(config.d_model)
+        self.ffn = SwiGLU(config.d_model, config.ffn_hidden_dim)
+
+    def forward(
+        self, x: torch.Tensor, kv_cache: KVCache | None = None
+    ) -> tuple[torch.Tensor, KVCache]:
+        attn_out, kv_cache = self.attn(self.attn_norm(x), kv_cache)
+        x = x + attn_out
+        x = x + self.ffn(self.ffn_norm(x))
+        return x, kv_cache
+
+
+class GPT(nn.Module):
+    """Decoder-only Transformer in the LLaMA style.
+
+    Differences from GPT-2: RoPE instead of a learned position table,
+    RMSNorm instead of LayerNorm, SwiGLU instead of a GELU FFN, no biases,
+    no dropout, and separate (untied) input embedding and output head.
+    """
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.config = config
+        head_dim = config.d_model // config.n_heads
+        # One RoPE table shared by every layer (it holds no parameters).
+        rope = RotaryEmbedding(head_dim, config.max_seq_len, config.rope_base)
+        self.embed = nn.Embedding(config.vocab_size, config.d_model)
+        self.blocks = nn.ModuleList(Block(config, rope) for _ in range(config.n_layers))
+        self.final_norm = RMSNorm(config.d_model)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # GPT-2 style: shrink the projections that write into the residual
+        # stream, so its variance doesn't grow with depth (2 per block).
+        residual_std = 0.02 / math.sqrt(2 * self.config.n_layers)
+        for block in self.blocks:
+            nn.init.normal_(block.attn.out.weight, mean=0.0, std=residual_std)
+            nn.init.normal_(block.ffn.w_down.weight, mean=0.0, std=residual_std)
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    def forward_with_cache(
+        self, idx: torch.Tensor, kv_caches: list[KVCache] | None = None
+    ) -> tuple[torch.Tensor, list[KVCache]]:
+        """Logits for idx (batch, seq_len), continuing after kv_caches."""
+        past_len = 0 if kv_caches is None else kv_caches[0][0].shape[2]
+        if past_len + idx.shape[1] > self.config.max_seq_len:
+            raise ValueError(
+                f"sequence length {past_len + idx.shape[1]} exceeds "
+                f"max_seq_len {self.config.max_seq_len}"
+            )
+        x = self.embed(idx)
+        new_caches = []
+        for i, block in enumerate(self.blocks):
+            x, cache = block(x, None if kv_caches is None else kv_caches[i])
+            new_caches.append(cache)
+        return self.lm_head(self.final_norm(x)), new_caches
+
+    def forward(
+        self, idx: torch.Tensor, targets: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Next-token logits (batch, seq_len, vocab), and the mean
+        cross-entropy against targets (batch, seq_len) when given."""
+        logits, _ = self.forward_with_cache(idx)
+        loss = None
+        if targets is not None:
+            # log-softmax over the vocab in float32 even under autocast.
+            loss = F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten())
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        eot_id: int | None = None,
+    ) -> torch.Tensor:
+        """Sample a continuation of idx (batch, seq_len) with a KV cache.
+
+        temperature 0 means greedy decoding. Stops early when every sequence
+        has produced eot_id, or when the context reaches max_seq_len.
+        """
+        max_new_tokens = min(max_new_tokens, self.config.max_seq_len - idx.shape[1])
+        if max_new_tokens <= 0:
+            return idx
+        logits, caches = self.forward_with_cache(idx)
+        finished = torch.zeros(idx.shape[0], dtype=torch.bool, device=idx.device)
+        for step in range(max_new_tokens):
+            next_logits = logits[:, -1, :]
+            if temperature == 0:
+                next_id = next_logits.argmax(dim=-1, keepdim=True)
+            else:
+                next_logits = next_logits / temperature
+                if top_k is not None:
+                    kth = next_logits.topk(top_k, dim=-1).values[:, -1:]
+                    next_logits = next_logits.masked_fill(next_logits < kth, float("-inf"))
+                next_id = torch.multinomial(next_logits.softmax(dim=-1), 1)
+            if eot_id is not None:
+                # Sequences that already ended keep emitting eot as padding.
+                next_id = next_id.masked_fill(finished[:, None], eot_id)
+                finished |= next_id[:, 0] == eot_id
+            idx = torch.cat((idx, next_id), dim=1)
+            if (eot_id is not None and finished.all()) or step == max_new_tokens - 1:
+                break
+            logits, caches = self.forward_with_cache(next_id, caches)
+        return idx

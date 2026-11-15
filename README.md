@@ -17,6 +17,11 @@ src/webbot/tokenizer/
   bpe.py           バイトレベルBPE(Python版の参照実装と、Rust版の呼び出し)
   unigram.py       Unigram言語モデル(SentencePiece方式、バイトフォールバック付き)
   wordpiece.py     WordPiece(BERT方式、## 付きの続きピース、バイトフォールバック付き)
+src/webbot/model/
+  gpt.py           LLaMA方式のGPT(RoPE・RMSNorm・SwiGLU・Pre-Norm、KVキャッシュ付き生成)
+  attention.py     因果Self-Attention(素朴な実装 / Flash Attention を切り替え)
+  flash_attention.py  Flash Attention(タイル分割とオンラインsoftmax、逆伝播は再計算)
+  rope.py / rmsnorm.py / swiglu.py
 rust/              BPEの学習とエンコードのRust実装(PyO3 + maturin、モジュール名 webbot_bpe)
 tests/             テスト
 ```
@@ -70,6 +75,16 @@ tests/             テスト
 - 学習はPythonのみで、ペア数の差分更新と遅延削除ヒープを使います。マージで出現回数が減った記号を含むペアは、スコアを計算し直します
 - テストでは、マージ列を「毎回全部数え直す素朴な実装」と完全一致で比べています。ほかに、出現回数ではなくスコアで選ぶこと、各位置で最長一致を取ることを確かめています
 
+### モデル
+
+- 2作目(storybot)のLLaMA方式GPTを引き継いでいます。dropoutなし、バイアスなし、埋め込みとLM headの重み共有なしです
+- **Flash Attention**(`GPTConfig(attn_impl="flash")`): Dao et al. (2022) の方式を、FlashAttention-2のループ順でPyTorchの演算として実装しています(`torch.autograd.Function`)
+  - 順伝播は、クエリのブロックごとにキーのブロックを順に見ていき、softmaxを「オンライン」で更新します(最大値・分母・出力を、最大値が増えるたびに補正します)。系列長×系列長のスコア行列は作りません
+  - 逆伝播用に保存するのは、出力と各クエリのlogsumexpだけです。確率はブロックごとに計算し直します。因果マスクで全部隠れるブロックは、順伝播でも逆伝播でも飛ばします
+  - KVキャッシュに対応しています(クエリがキーより短い場合、クエリは末尾の位置として扱います)
+  - 計算はfloat32以上で行います。bf16のautocastの中でも、内側の行列積をbf16に落としません
+  - テストでは、出力と勾配を素朴な実装と比べています(float64で1e-10の精度)。ほかに、`gradcheck`、保存したlogsumexpが正確なこと、逆伝播用に保存されるテンソルに系列長の2乗の大きさのものがないこと、モデル全体の損失・勾配・KVキャッシュ付き生成が素朴な実装と一致することを確かめています
+
 ## 現状
 
 トークナイザーまで実装済みです。
@@ -108,7 +123,21 @@ tests/             テスト
   - ペアの最低出現回数を設けると改善しました(実験用のコピーで確認、語彙16,000)。最低10回で1.04、100回で1.56、1,000回で1.25文字/トークンでした
   - 1,000万字・語彙8,000では、「先頭形」と「続き形(##)」の両方が必要な文字だけで7,684枠を使い、マージできたのは52回でした
 
-検索器・モデル・学習はこれから実装します。
+**注意機構の速度とメモリ**: CPU(i7-13700F、16スレッド)で順伝播と逆伝播を測りました。条件は、バッチ1・ヘッド8・ヘッド次元32・float32・因果マスクありです。メモリは、各条件を別プロセスで実行したときのピークの増分です。
+
+| 系列長 | 素朴な実装 | Flash Attention(自作、ブロック128) | PyTorchの `scaled_dot_product_attention` |
+|---|---|---|---|
+| 256 | 1.4ms / +46MB | 3.9ms / +46MB | 1.4ms / +41MB |
+| 512 | 3.9ms / +72MB | 8.3ms / +49MB | 4.0ms / +47MB |
+| 1024 | 27ms / +142MB | 35ms / +52MB | 12ms / +63MB |
+| 2048 | 122ms / +441MB | 130ms / +60MB | 37ms / +65MB |
+| 4096 | 643ms / +1,655MB | 484ms / +73MB | 96ms / +80MB |
+
+- メモリは、素朴な実装が系列長の2乗で増えるのに対し、Flash Attentionはほぼ線形でした
+- 速度は、自作のFlash Attentionがブロックごとに Python のループを回すため、短い系列では素朴な実装より遅いです(256で約2.8倍)。素朴な実装を上回ったのは4096からでした。PyTorch組み込みの融合カーネル(SDPA)は、どの長さでも最速でした
+- ブロックの大きさは、系列長1024のとき、32で247ms、64で74ms、128で35ms、256で24ms、512で25msでした。大きいほどループの回数が減って速くなる一方、メモリは増えます
+
+検索器と学習はこれから実装します。
 
 ## セットアップ
 
@@ -116,6 +145,7 @@ Windows・Python 3.12で動作を確認しています。Rust版のビルドに�
 
 ```
 python -m venv .venv
+.venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cpu
 .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\maturin develop --release -m rust/Cargo.toml
 .venv\Scripts\python -m pytest tests
