@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .attention import CausalSelfAttention, KVCache
+from .moe import MoE
 from .rmsnorm import RMSNorm
 from .rope import RotaryEmbedding
 from .swiglu import SwiGLU
@@ -24,6 +25,11 @@ class GPTConfig:
     ffn_hidden_dim: int | None = None  # None -> SwiGLU default (~8/3 * d_model)
     rope_base: float = 10000.0
     attn_impl: str = "naive"  # "naive" or "flash" (see CausalSelfAttention)
+    # Mixture of experts: n_experts > 0 replaces every block's FFN with an
+    # MoE of that many SwiGLU experts (each of ffn_hidden_dim), top-k routed.
+    n_experts: int = 0
+    moe_top_k: int = 2
+    moe_aux_coef: float = 0.01  # weight of the load-balancing loss in training
 
 
 class Block(nn.Module):
@@ -36,7 +42,12 @@ class Block(nn.Module):
             config.d_model, config.n_heads, rope, config.attn_impl, config.n_kv_heads
         )
         self.ffn_norm = RMSNorm(config.d_model)
-        self.ffn = SwiGLU(config.d_model, config.ffn_hidden_dim)
+        if config.n_experts > 0:
+            self.ffn = MoE(
+                config.d_model, config.n_experts, config.moe_top_k, config.ffn_hidden_dim
+            )
+        else:
+            self.ffn = SwiGLU(config.d_model, config.ffn_hidden_dim)
 
     def forward(
         self, x: torch.Tensor, kv_cache: KVCache | None = None
@@ -76,10 +87,28 @@ class GPT(nn.Module):
         residual_std = 0.02 / math.sqrt(2 * self.config.n_layers)
         for block in self.blocks:
             nn.init.normal_(block.attn.out.weight, mean=0.0, std=residual_std)
-            nn.init.normal_(block.ffn.w_down.weight, mean=0.0, std=residual_std)
+            experts = block.ffn.experts if isinstance(block.ffn, MoE) else [block.ffn]
+            for ffn in experts:
+                nn.init.normal_(ffn.w_down.weight, mean=0.0, std=residual_std)
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def num_active_params(self) -> int:
+        """Parameters a single token passes through: with MoE, only top_k
+        of each layer's experts."""
+        n = self.num_params()
+        for block in self.blocks:
+            if isinstance(block.ffn, MoE):
+                per_expert = sum(p.numel() for p in block.ffn.experts[0].parameters())
+                n -= (block.ffn.n_experts - block.ffn.top_k) * per_expert
+        return n
+
+    def moe_aux_loss(self) -> torch.Tensor:
+        """Mean load-balancing loss over the MoE layers of the last forward
+        (0 without MoE)."""
+        losses = [b.ffn.aux_loss for b in self.blocks if isinstance(b.ffn, MoE)]
+        return torch.stack(losses).mean() if losses else torch.zeros(())
 
     def forward_with_cache(
         self, idx: torch.Tensor, kv_caches: list[KVCache] | None = None
@@ -102,12 +131,19 @@ class GPT(nn.Module):
         self, idx: torch.Tensor, targets: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Next-token logits (batch, seq_len, vocab), and the mean
-        cross-entropy against targets (batch, seq_len) when given."""
+        cross-entropy against targets (batch, seq_len) when given.
+
+        With MoE in training mode, the loss also includes moe_aux_coef times
+        the load-balancing loss (the quantity to minimize); in eval mode it
+        is the cross-entropy alone.
+        """
         logits, _ = self.forward_with_cache(idx)
         loss = None
         if targets is not None:
             # log-softmax over the vocab in float32 even under autocast.
             loss = F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten())
+            if self.training and self.config.n_experts > 0:
+                loss = loss + self.config.moe_aux_coef * self.moe_aux_loss()
         return logits, loss
 
     @torch.no_grad()
