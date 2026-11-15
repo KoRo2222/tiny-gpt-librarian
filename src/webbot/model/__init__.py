@@ -1,4 +1,5 @@
 from .attention import CausalSelfAttention
+from .compile import compile_model, setup_compiler
 from .gpt import GPT, Block, GPTConfig
 from .moe import MoE
 from .rmsnorm import RMSNorm
@@ -14,4 +15,6 @@ __all__ = [
     "RMSNorm",
     "RotaryEmbedding",
     "SwiGLU",
+    "compile_model",
+    "setup_compiler",
 ]

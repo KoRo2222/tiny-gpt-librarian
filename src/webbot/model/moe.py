@@ -55,22 +55,22 @@ class MoE(nn.Module):
         gates = top_p if self.top_k == 1 else top_p / top_p.sum(dim=-1, keepdim=True)
 
         # Group the (token, slot) assignments by expert: one batched call
-        # per expert instead of one per token.
+        # per expert instead of one per token. No Python branch depends on
+        # the counts (an expert with no tokens gets an empty batch), so
+        # torch.compile can trace this into one graph.
         flat_e = top_e.flatten()
         order = flat_e.argsort(stable=True)
         token_of = order // self.top_k
-        gate_of = gates.flatten()[order]
-        counts = torch.bincount(flat_e, minlength=self.n_experts)
+        counts = torch.zeros(self.n_experts, dtype=torch.long, device=x.device)
+        counts = counts.scatter_add(0, flat_e, torch.ones_like(flat_e))
 
-        out = torch.zeros_like(x)
-        start = 0
-        for e, n in enumerate(counts.tolist()):
-            if n == 0:
-                continue
-            idx = token_of[start : start + n]
-            y = self.experts[e](x[idx]) * gate_of[start : start + n, None]
-            out.index_add_(0, idx, y.to(out.dtype))
-            start += n
+        x_sorted = x[token_of]
+        ys = [
+            expert(xs)
+            for expert, xs in zip(self.experts, x_sorted.split(counts.tolist()))
+        ]
+        y = torch.cat(ys) * gates.flatten()[order, None]
+        out = torch.zeros_like(x).index_add_(0, token_of, y.to(x.dtype))
 
         frac = counts.to(probs.dtype) / (n_tokens * self.top_k)
         self.aux_loss = self.n_experts * (frac * probs.mean(dim=0)).sum()

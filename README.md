@@ -22,6 +22,7 @@ src/webbot/model/
   attention.py     因果Self-Attention(GQA対応、素朴な実装 / Flash Attention を切り替え)
   flash_attention.py  Flash Attention(タイル分割とオンラインsoftmax、逆伝播は再計算)
   moe.py           Mixture of Experts(上位k個の専門家に振り分けるFFN、負荷分散の補助損失)
+  compile.py       torch.compile の準備(WindowsでMSVCの環境を読み込む)とモデルのコンパイル
   rope.py / rmsnorm.py / swiglu.py
 rust/              BPEの学習とエンコードのRust実装(PyO3 + maturin、モジュール名 webbot_bpe)
 tests/             テスト
@@ -96,6 +97,12 @@ tests/             テスト
   - 負荷分散の補助損失は、Switch Transformerの `E × Σ_i f_i × P_i` です(f_i は専門家 i に割り当てられた割合、P_i はルーター確率の平均)。振り分けが均等なら1で、偏るほど大きくなります。学習モード(`model.train()`)では、損失に `moe_aux_coef`(既定0.01)倍で足します。評価モードの損失は交差エントロピーだけです
   - `n_experts=0`(既定)なら、今までどおりの密なFFNです。`num_active_params()` で、1トークンが通るパラメータ数を数えられます
   - テストでは、出力・補助損失・全パラメータの勾配を「1トークンずつ上位k個を選んで足す素朴な実装」と比べています(float64で1e-10の精度)。ほかに、全専門家を同じ重みにすると密なFFNと一致すること、補助損失だけを下げる方向に学習すると偏っていた振り分けが実際に分散することを確かめています
+- **torch.compile**(`compile_model(model)`): PyTorch 2のコンパイラーで、学習・評価の順伝播と逆伝播をまとめてコンパイルします(TorchDynamoがPythonのコードからグラフを取り出し、InductorがCPU向けのC++/OpenMPのコードを生成します)
+  - InductorはC++コンパイラーを使います。Windowsでは、`cl.exe` が見つからなければ、Visual Studio Build Tools の `vcvars64.bat` の環境を自動でプロセスに読み込みます(`setup_compiler()`)
+  - その場でコンパイルする(`nn.Module.compile`)ので、`state_dict` のキーはコンパイル前と同じで、チェックポイントをそのまま使い回せます
+  - コンパイルされるのは `model(idx, targets)` の呼び出しだけです。`generate` は1トークンごとに形が変わるので、eagerのまま動きます
+  - 素朴な実装・Flash Attention・GQA・MoEのどの構成でも、グラフは途切れず1つになります。MoEは、専門家ごとのトークン数で分岐しない書き方にし、データで決まる大きさをグラフに取り込む設定(`capture_scalar_outputs` など)を有効にしています
+  - テストでは、各構成で学習の順伝播がグラフ1つになること、コンパイルした学習3ステップの損失と更新後の重みがeagerと一致すること(実際にコンパイルされ、eagerに戻っていないことも確認)、`state_dict`・評価時の損失・生成が変わらないことを確かめています
 
 ## 現状
 
@@ -176,11 +183,25 @@ tests/             テスト
 - 生成は、1トークンずつ専門家のループを回すので、30〜45%遅くなりました
 - 同じ計算量で損失が下がるかどうか(MoEの本来の利点)は、まだ実データの学習で確かめていません
 
+**torch.compileの効果**: 同じモデル(d=256・6層・クエリヘッド8)で、16×256トークンの学習1ステップ(順伝播・逆伝播・AdamW)を、eagerとコンパイル版で交互に10回ずつ測った中央値です。
+
+| 構成 | eager | コンパイル版 | 速さ |
+|---|---|---|---|
+| 密なFFN・素朴な注意 | 928ms | 867ms | 1.07倍 |
+| Flash Attention | 887ms | 797ms | 1.11倍 |
+| GQA(K/Vヘッド2) | 892ms | 786ms | 1.13倍 |
+| MoE(E=4・k=1) | 1,128ms | 912ms | 1.24倍 |
+| MoE(E=4・k=2) | 1,424ms | 1,154ms | 1.23倍 |
+
+- 速くなったのは7〜24%でした。損失はeagerと2e-6以内で一致しました
+- 最初のコンパイルには、構成によって40〜60秒かかりました。Inductorのディスクキャッシュが効く2回目以降は、数秒です
+- 速さの差が小さめなのは、学習時間の多くを行列積(特に語彙8,008への射影)が占め、コンパイルで融合できるのが主に要素ごとの演算だからだと考えています(内訳は測っていません)
+
 検索器と学習はこれから実装します。
 
 ## セットアップ
 
-Windows・Python 3.12で動作を確認しています。Rust版のビルドには、Rust(MSVCツールチェーン)と Visual Studio Build Tools(C++)が必要です。
+Windows・Python 3.12で動作を確認しています。Rust版のビルドには、Rust(MSVCツールチェーン)と Visual Studio Build Tools(C++)が必要です。torch.compile にも Visual Studio Build Tools(C++)を使います(環境変数は自動で読み込むので、開発者用のシェルから起動する必要はありません)。C++コンパイラーがない環境では、torch.compile のテストはスキップされます。
 
 ```
 python -m venv .venv
