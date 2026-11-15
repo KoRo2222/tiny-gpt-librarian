@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +24,11 @@ class GPTConfig:
     n_kv_heads: int | None = None  # None -> n_heads (no grouping); see CausalSelfAttention
     ffn_hidden_dim: int | None = None  # None -> SwiGLU default (~8/3 * d_model)
     rope_base: float = 10000.0
+    # Context extension (see rope_frequencies): None, "pi", "ntk" or "yarn",
+    # stretching RoPE by rope_factor beyond rope_original_max_seq_len.
+    rope_scaling: str | None = None
+    rope_factor: float = 1.0
+    rope_original_max_seq_len: int | None = None
     attn_impl: str = "naive"  # "naive" or "flash" (see CausalSelfAttention)
     # Mixture of experts: n_experts > 0 replaces every block's FFN with an
     # MoE of that many SwiGLU experts (each of ffn_hidden_dim), top-k routed.
@@ -71,7 +76,14 @@ class GPT(nn.Module):
         self.config = config
         head_dim = config.d_model // config.n_heads
         # One RoPE table shared by every layer (it holds no parameters).
-        rope = RotaryEmbedding(head_dim, config.max_seq_len, config.rope_base)
+        rope = RotaryEmbedding(
+            head_dim,
+            config.max_seq_len,
+            config.rope_base,
+            config.rope_scaling,
+            config.rope_factor,
+            config.rope_original_max_seq_len,
+        )
         self.embed = nn.Embedding(config.vocab_size, config.d_model)
         self.blocks = nn.ModuleList(Block(config, rope) for _ in range(config.n_layers))
         self.final_norm = RMSNorm(config.d_model)
@@ -184,3 +196,29 @@ class GPT(nn.Module):
                 break
             logits, caches = self.forward_with_cache(next_id, caches)
         return idx
+
+
+def extend_context(model: GPT, max_seq_len: int, scaling: str = "yarn") -> GPT:
+    """A copy of model whose RoPE is stretched to max_seq_len tokens.
+
+    RoPE has no parameters, so the weights are reused unchanged; only the
+    position tables differ. factor = max_seq_len / the length model was
+    trained on. The result can be used as is or fine-tuned briefly on long
+    sequences (as PI and YaRN do).
+    """
+    config = model.config
+    if config.rope_scaling is not None:
+        raise ValueError("model is already context-extended")
+    if max_seq_len <= config.max_seq_len:
+        raise ValueError(f"max_seq_len must exceed {config.max_seq_len}")
+    new_config = replace(
+        config,
+        max_seq_len=max_seq_len,
+        rope_scaling=scaling,
+        rope_factor=max_seq_len / config.max_seq_len,
+        rope_original_max_seq_len=config.max_seq_len,
+    )
+    param = next(model.parameters())
+    extended = GPT(new_config).to(device=param.device, dtype=param.dtype)
+    extended.load_state_dict(model.state_dict())
+    return extended
