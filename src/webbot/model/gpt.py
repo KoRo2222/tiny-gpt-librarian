@@ -20,6 +20,7 @@ class GPTConfig:
     d_model: int = 256
     n_layers: int = 6
     n_heads: int = 8
+    n_kv_heads: int | None = None  # None -> n_heads (no grouping); see CausalSelfAttention
     ffn_hidden_dim: int | None = None  # None -> SwiGLU default (~8/3 * d_model)
     rope_base: float = 10000.0
     attn_impl: str = "naive"  # "naive" or "flash" (see CausalSelfAttention)
@@ -32,7 +33,7 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm(config.d_model)
         self.attn = CausalSelfAttention(
-            config.d_model, config.n_heads, rope, config.attn_impl
+            config.d_model, config.n_heads, rope, config.attn_impl, config.n_kv_heads
         )
         self.ffn_norm = RMSNorm(config.d_model)
         self.ffn = SwiGLU(config.d_model, config.ffn_hidden_dim)

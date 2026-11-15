@@ -12,6 +12,10 @@ On a GPU the point is fewer slow-memory round trips. Here (CPU, PyTorch
 ops per tile) the gain is memory: activation memory linear in sequence
 length instead of quadratic. It is not expected to beat a fused kernel in
 speed.
+
+Leading (batch/head) dims broadcast, so grouped-query attention can pass
+k and v with a size-1 group dim instead of copies per query head; the
+gradients of broadcast inputs are summed back to their shapes.
 """
 
 from __future__ import annotations
@@ -52,15 +56,16 @@ class _FlashAttention(torch.autograd.Function):
         qc, kc, vc = q.to(cdt), k.to(cdt), v.to(cdt)
         len_q, len_k = q.shape[-2], k.shape[-2]
         offset = len_k - len_q
-        out = torch.empty(*q.shape[:-1], v.shape[-1], dtype=cdt, device=q.device)
-        lse = torch.empty(q.shape[:-1], dtype=cdt, device=q.device)
+        batch = torch.broadcast_shapes(q.shape[:-2], k.shape[:-2], v.shape[:-2])
+        out = torch.empty(*batch, len_q, v.shape[-1], dtype=cdt, device=q.device)
+        lse = torch.empty(*batch, len_q, dtype=cdt, device=q.device)
 
         for qs in range(0, len_q, block_q):
             qe = min(qs + block_q, len_q)
             qb = qc[..., qs:qe, :]
-            m = torch.full(qb.shape[:-1], -math.inf, dtype=cdt, device=q.device)
+            m = torch.full((*batch, qe - qs), -math.inf, dtype=cdt, device=q.device)
             l = torch.zeros_like(m)
-            acc = torch.zeros(*qb.shape[:-1], v.shape[-1], dtype=cdt, device=q.device)
+            acc = torch.zeros(*batch, qe - qs, v.shape[-1], dtype=cdt, device=q.device)
             # Keys after the last query's position are never visible.
             k_stop = min(len_k, offset + qe) if causal else len_k
             for ks in range(0, k_stop, block_k):
@@ -103,15 +108,18 @@ class _FlashAttention(torch.autograd.Function):
 
         # D_i = sum_j P_ij dP_ij = rowsum(dO * O)
         delta = (do * out).sum(dim=-1)
-        dq = torch.zeros_like(qc)
+        batch = out.shape[:-2]
+        # dq is accumulated at the broadcast shape and summed down at the
+        # end; dk/dv per key block.
+        dq = torch.zeros(*batch, len_q, q.shape[-1], dtype=cdt, device=q.device)
         dk = torch.zeros_like(kc)
         dv = torch.zeros_like(vc)
 
         for ks in range(0, len_k, block_k):
             ke = min(ks + block_k, len_k)
             kb, vb = kc[..., ks:ke, :], vc[..., ks:ke, :]
-            dk_b = torch.zeros_like(kb)
-            dv_b = torch.zeros_like(vb)
+            dk_b = torch.zeros(*batch, ke - ks, k.shape[-1], dtype=cdt, device=q.device)
+            dv_b = torch.zeros(*batch, ke - ks, v.shape[-1], dtype=cdt, device=q.device)
             # Only queries at positions >= ks can see this key block.
             q_first = max(0, ks - offset) if causal else 0
             for qs in range((q_first // block_q) * block_q, len_q, block_q):
@@ -128,9 +136,10 @@ class _FlashAttention(torch.autograd.Function):
                 ds = p * (dp - delta[..., qs:qe, None])
                 dq[..., qs:qe, :] += (ds @ kb) * scale
                 dk_b += (ds.transpose(-2, -1) @ qb) * scale
-            dk[..., ks:ke, :] = dk_b
-            dv[..., ks:ke, :] = dv_b
+            dk[..., ks:ke, :] = dk_b.sum_to_size(kb.shape)
+            dv[..., ks:ke, :] = dv_b.sum_to_size(vb.shape)
 
+        dq = dq.sum_to_size(qc.shape)
         return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None, None
 
 
@@ -144,7 +153,8 @@ def flash_attention(
 ) -> torch.Tensor:
     """softmax(q k^T / sqrt(d)) v over the last two dims, tiled.
 
-    q is (..., len_q, d), k and v are (..., len_k, d). With causal=True,
+    q is (..., len_q, d), k and v are (..., len_k, d), with leading dims
+    that broadcast against each other. With causal=True,
     query i is at position len_k - len_q + i (the queries are the last
     len_q positions, as with a KV cache) and sees keys at positions <= it.
     """

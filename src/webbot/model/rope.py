@@ -49,7 +49,8 @@ class RotaryEmbedding(nn.Module):
         sin = self.sin[offset : offset + seq_len]
         # Rotate in float32 even for half-precision inputs: bf16 cos/sin are
         # only accurate to ~3 digits, and the error would differ per position.
-        x1, x2 = x.float().chunk(2, dim=-1)
+        # (float64 input stays float64.)
+        x1, x2 = x.to(torch.promote_types(x.dtype, torch.float32)).chunk(2, dim=-1)
         # 2D rotation of each (x1[i], x2[i]) pair.
         out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
         return out.to(x.dtype)
