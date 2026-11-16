@@ -1,5 +1,6 @@
 from .attention import CausalSelfAttention
 from .compile import compile_model, setup_compiler
+from .grad_checkpoint import checkpoint
 from .gpt import GPT, Block, GPTConfig, extend_context
 from .moe import MoE
 from .rmsnorm import RMSNorm
@@ -15,6 +16,7 @@ __all__ = [
     "RMSNorm",
     "RotaryEmbedding",
     "SwiGLU",
+    "checkpoint",
     "compile_model",
     "extend_context",
     "rope_frequencies",

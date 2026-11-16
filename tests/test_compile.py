@@ -21,6 +21,9 @@ CONFIGS = {
     "flash_gqa": {"attn_impl": "flash", "n_kv_heads": 2},
     "moe_top1": {"n_experts": 4, "moe_top_k": 1},
     "moe_top2_gqa": {"n_experts": 4, "moe_top_k": 2, "n_kv_heads": 1},
+    # Gradient checkpointing switches to torch.utils.checkpoint when compiled.
+    "ckpt_dense": {"grad_checkpoint": True},
+    "ckpt_moe": {"grad_checkpoint": True, "n_experts": 4, "moe_top_k": 2},
 }
 
 
@@ -66,7 +69,7 @@ def _train(model, step_fn, steps=3):
     return losses
 
 
-@pytest.mark.parametrize("name", ["dense", "moe_top2_gqa", "flash_gqa"])
+@pytest.mark.parametrize("name", ["dense", "moe_top2_gqa", "flash_gqa", "ckpt_dense", "ckpt_moe"])
 def test_compiled_training_matches_eager(name):
     eager = _gpt(**CONFIGS[name])
     compiled = copy.deepcopy(eager)

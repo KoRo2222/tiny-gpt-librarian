@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .attention import CausalSelfAttention, KVCache
+from .grad_checkpoint import checkpoint
 from .moe import MoE
 from .rmsnorm import RMSNorm
 from .rope import RotaryEmbedding
@@ -35,6 +36,9 @@ class GPTConfig:
     n_experts: int = 0
     moe_top_k: int = 2
     moe_aux_coef: float = 0.01  # weight of the load-balancing loss in training
+    # Gradient checkpointing: in training forwards (grad enabled, no KV
+    # cache) keep only each block's input and recompute the block in backward.
+    grad_checkpoint: bool = False
 
 
 class Block(nn.Module):
@@ -57,10 +61,23 @@ class Block(nn.Module):
     def forward(
         self, x: torch.Tensor, kv_cache: KVCache | None = None
     ) -> tuple[torch.Tensor, KVCache]:
+        x, kv_cache, moe_stats = self.forward_pure(x, kv_cache)
+        if moe_stats is not None:
+            self.ffn.aux_loss, self.ffn.last_counts = moe_stats
+        return x, kv_cache
+
+    def forward_pure(
+        self, x: torch.Tensor, kv_cache: KVCache | None = None
+    ) -> tuple[torch.Tensor, KVCache, tuple[torch.Tensor, torch.Tensor] | None]:
+        """Like forward, but returns the MoE statistics (balancing loss,
+        tokens per expert; None for a dense FFN) instead of storing them."""
         attn_out, kv_cache = self.attn(self.attn_norm(x), kv_cache)
         x = x + attn_out
-        x = x + self.ffn(self.ffn_norm(x))
-        return x, kv_cache
+        h = self.ffn_norm(x)
+        if isinstance(self.ffn, MoE):
+            out, aux_loss, counts = self.ffn.route(h)
+            return x + out, kv_cache, (aux_loss, counts)
+        return x + self.ffn(h), kv_cache, None
 
 
 class GPT(nn.Module):
@@ -125,7 +142,9 @@ class GPT(nn.Module):
     def forward_with_cache(
         self, idx: torch.Tensor, kv_caches: list[KVCache] | None = None
     ) -> tuple[torch.Tensor, list[KVCache]]:
-        """Logits for idx (batch, seq_len), continuing after kv_caches."""
+        """Logits for idx (batch, seq_len), continuing after kv_caches.
+        With grad_checkpoint (training: grad enabled, no kv_caches) the
+        returned cache list is empty."""
         past_len = 0 if kv_caches is None else kv_caches[0][0].shape[2]
         if past_len + idx.shape[1] > self.config.max_seq_len:
             raise ValueError(
@@ -134,10 +153,31 @@ class GPT(nn.Module):
             )
         x = self.embed(idx)
         new_caches = []
-        for i, block in enumerate(self.blocks):
-            x, cache = block(x, None if kv_caches is None else kv_caches[i])
-            new_caches.append(cache)
+        if self.config.grad_checkpoint and kv_caches is None and torch.is_grad_enabled():
+            # The caches are not needed for training; only x (and the MoE
+            # balancing loss) leave each checkpointed block.
+            for block in self.blocks:
+                x = self._checkpointed_block(block, x)
+        else:
+            for i, block in enumerate(self.blocks):
+                x, cache = block(x, None if kv_caches is None else kv_caches[i])
+                new_caches.append(cache)
         return self.lm_head(self.final_norm(x)), new_caches
+
+    @staticmethod
+    def _checkpointed_block(block: Block, x: torch.Tensor) -> torch.Tensor:
+        # The MoE balancing loss is computed inside the block; it must be a
+        # checkpoint output, or the copy computed without a graph would give
+        # the router no gradient. The block itself stores nothing while
+        # checkpointed (state changes can't be replayed under torch.compile).
+        def run(h):
+            out, _, moe_stats = block.forward_pure(h)
+            return (out,) if moe_stats is None else (out, *moe_stats)
+
+        outs = checkpoint(run, x)
+        if len(outs) == 3:
+            block.ffn.aux_loss, block.ffn.last_counts = outs[1], outs[2]
+        return outs[0]
 
     def forward(
         self, idx: torch.Tensor, targets: torch.Tensor | None = None

@@ -44,6 +44,13 @@ class MoE(nn.Module):
         self.last_counts = torch.zeros(n_experts, dtype=torch.long)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, self.aux_loss, self.last_counts = self.route(x)
+        return out
+
+    def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(output, balancing loss, tokens per expert), without storing
+        anything on the module (so it can run inside a checkpointed or
+        compiled region)."""
         shape = x.shape
         x = x.reshape(-1, shape[-1])  # (tokens, d_model)
         n_tokens = x.shape[0]
@@ -73,6 +80,5 @@ class MoE(nn.Module):
         out = torch.zeros_like(x).index_add_(0, token_of, y.to(x.dtype))
 
         frac = counts.to(probs.dtype) / (n_tokens * self.top_k)
-        self.aux_loss = self.n_experts * (frac * probs.mean(dim=0)).sum()
-        self.last_counts = counts.detach()
-        return out.view(shape)
+        aux_loss = self.n_experts * (frac * probs.mean(dim=0)).sum()
+        return out.view(shape), aux_loss, counts.detach()
