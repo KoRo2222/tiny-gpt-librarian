@@ -6,3 +6,4 @@ CLAUDE.md
 /data/
 rust/target/
 *.pyd
+/wandb/

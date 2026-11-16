@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +26,7 @@ from .distributed import (
 from .precision import Precision, resolve_precision
 from .muon import make_muon_optimizer
 from .schedule import d2z_scheduler
+from .tracking import WandbTracker
 from .zero import ZeroOptimizer
 from .step import train_step
 
@@ -42,6 +43,12 @@ class PretrainConfig:
     muon_lr: float = 0.02
     muon_momentum: float = 0.95
     muon_weight_decay: float = 0.0
+    # Weights & Biases (see tracking.py): tracking is on when a project is
+    # set; "offline" keeps the run on this machine, "online" uploads it.
+    wandb_project: str | None = None
+    wandb_run_name: str | None = None
+    wandb_mode: str = "offline"
+    wandb_dir: str | None = None
     seq_len: int = 256
     peak_lr: float = 1e-3
     warmup_steps: int = 100
@@ -190,6 +197,23 @@ def pretrain(
         log(f"resumed from {checkpoint_path} at step {step}")
     broadcast_parameters(model)  # replicas start identical
 
+    tracker = None
+    if config.wandb_project is not None and is_main:
+        tracker = WandbTracker(
+            config.wandb_project,
+            config={
+                "pretrain": vars(config),
+                "model": asdict(model.config),
+                "num_params": model.num_params(),
+                "world_size": world_size(),
+            },
+            name=config.wandb_run_name,
+            mode=config.wandb_mode,
+            dir=config.wandb_dir,
+            # Continue the interrupted run's record when resuming.
+            run_id=ckpt.get("wandb_run_id") if resume else None,
+        )
+
     def run_eval() -> None:
         val_loss = evaluate(
             model,
@@ -211,7 +235,10 @@ def pretrain(
                 step=step,
                 history=history,
                 pretrain_config=vars(config),
+                wandb_run_id=None if tracker is None else tracker.run_id,
             )
+        if tracker is not None:
+            tracker.log({"val/loss": val_loss, "val/ppl": math.exp(val_loss)}, step)
         # Logged after saving: once this line appears, the step is on disk.
         log(
             f"step {step:>6}/{config.total_steps} | train {train_loss:.4f} | "
@@ -228,23 +255,42 @@ def pretrain(
     )
     start = time.perf_counter()
     train_loss = float("nan")
-    while step < config.total_steps:
-        idx, targets = batches.next()
-        local_loss = train_step(
-            model,
-            idx[row_start:row_stop].to(device),
-            targets[row_start:row_stop].to(device),
-            optimizer,
-            precision,
-            scaler,
-            scheduler,
-            config.max_grad_norm,
-            config.grad_accum_steps,
-            grad_sync,
-        )
-        (train_loss,) = all_reduce_sum(local_loss * share) if is_distributed() else (local_loss,)
-        step += 1
-        elapsed = time.perf_counter() - start
-        if step % config.eval_interval == 0 or step == config.total_steps:
-            run_eval()
+    tokens_per_step = config.batch_size * config.seq_len
+    try:
+        while step < config.total_steps:
+            idx, targets = batches.next()
+            lr = optimizer.param_groups[0]["lr"]  # the lr this update uses
+            t0 = time.perf_counter()
+            local_loss = train_step(
+                model,
+                idx[row_start:row_stop].to(device),
+                targets[row_start:row_stop].to(device),
+                optimizer,
+                precision,
+                scaler,
+                scheduler,
+                config.max_grad_norm,
+                config.grad_accum_steps,
+                grad_sync,
+            )
+            (train_loss,) = all_reduce_sum(local_loss * share) if is_distributed() else (local_loss,)
+            step += 1
+            step_time = time.perf_counter() - t0
+            elapsed = time.perf_counter() - start
+            if tracker is not None:
+                tracker.log(
+                    {
+                        "train/loss": train_loss,
+                        "train/lr": lr,
+                        "train/tokens": step * tokens_per_step,
+                        "train/step_time": step_time,
+                        "train/tokens_per_sec": tokens_per_step / step_time,
+                    },
+                    step,
+                )
+            if step % config.eval_interval == 0 or step == config.total_steps:
+                run_eval()
+    finally:
+        if tracker is not None:
+            tracker.finish()
     return history
