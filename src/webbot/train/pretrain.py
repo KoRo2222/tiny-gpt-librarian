@@ -24,6 +24,7 @@ from .distributed import (
     world_size,
 )
 from .precision import Precision, resolve_precision
+from .muon import make_muon_optimizer
 from .schedule import d2z_scheduler
 from .zero import ZeroOptimizer
 from .step import train_step
@@ -35,6 +36,12 @@ class PretrainConfig:
     batch_size: int = 16  # sequences per optimizer update
     grad_accum_steps: int = 1  # micro-batches the batch is split into
     zero_stage: int = 0  # 0: plain AdamW; 1/2: ZeRO-sharded AdamW (see zero.py)
+    # "adamw", or "muon": Muon for the hidden matrices (muon_lr), AdamW with
+    # peak_lr for the rest (see muon.py)
+    optimizer: str = "adamw"
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    muon_weight_decay: float = 0.0
     seq_len: int = 256
     peak_lr: float = 1e-3
     warmup_steps: int = 100
@@ -137,7 +144,17 @@ def pretrain(
     torch.manual_seed(config.seed)
     model.to(device).train()
     precision = resolve_precision(device, config.precision)
-    if config.zero_stage:
+    if config.optimizer not in ("adamw", "muon"):
+        raise ValueError(f"unknown optimizer {config.optimizer!r}")
+    if config.optimizer == "muon":
+        if config.zero_stage:
+            raise ValueError("Muon needs whole matrices; it is not combined with ZeRO")
+        optimizer = make_muon_optimizer(
+            model, config.muon_lr, config.peak_lr, config.weight_decay, config.betas,
+            config.muon_momentum, config.muon_weight_decay,
+        )
+        scheduler = d2z_scheduler(optimizer, config.total_steps, config.warmup_steps)
+    elif config.zero_stage:
         if precision.name == "fp16":
             raise ValueError("ZeRO is not combined with fp16 loss scaling")
         optimizer = ZeroOptimizer(
