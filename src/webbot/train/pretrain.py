@@ -14,6 +14,15 @@ from webbot.data import RandomBatches, sequential_batches
 from webbot.model import GPT
 
 from .checkpoint import load_checkpoint, save_checkpoint
+from .distributed import (
+    all_reduce_gradients,
+    all_reduce_sum,
+    broadcast_parameters,
+    is_distributed,
+    local_rows,
+    rank,
+    world_size,
+)
 from .precision import Precision, resolve_precision
 from .schedule import d2z_scheduler
 from .step import train_step
@@ -63,16 +72,24 @@ def evaluate(
     precision: Precision,
     device: str | torch.device = "cpu",
 ) -> float:
-    """Mean loss over batches (weighted by batch size), in eval mode."""
+    """Mean loss over batches (weighted by batch size), in eval mode.
+
+    In data-parallel training every rank must call this with the same
+    batches: each evaluates every world_size-th batch and the sums are
+    combined, so all ranks return the same value.
+    """
     was_training = model.training
     model.eval()
     total, count = 0.0, 0
-    for idx, targets in batches:
+    for i, (idx, targets) in enumerate(batches):
+        if i % world_size() != rank():
+            continue
         with precision.autocast():
             _, loss = model(idx.to(device), targets.to(device))
         total += loss.item() * idx.shape[0]
         count += idx.shape[0]
     model.train(was_training)
+    total, count = all_reduce_sum(total, count)
     return total / count
 
 
@@ -98,6 +115,13 @@ def pretrain(
     are processed as that many micro-batches (see train_step), which lowers
     activation memory without changing the update. The batches drawn do not
     depend on grad_accum_steps.
+
+    Inside a process group (see distributed.launch) training is data
+    parallel: every rank draws the same batch and trains on its share of
+    the rows (grad_accum_steps then splits that share), gradients are
+    averaged across ranks before each step, and the result equals a single
+    process training on the whole batch. Only rank 0 logs and writes
+    checkpoints; every rank must be given the same arguments.
     """
     if config.seq_len > model.config.max_seq_len:
         raise ValueError(
@@ -110,6 +134,12 @@ def pretrain(
     scheduler = d2z_scheduler(optimizer, config.total_steps, config.warmup_steps)
     scaler = precision.make_grad_scaler()
     batches = RandomBatches(train_tokens, config.seq_len, config.batch_size, config.seed)
+    row_start, row_stop = local_rows(config.batch_size)
+    share = (row_stop - row_start) / config.batch_size
+    grad_sync = (lambda: all_reduce_gradients(model, share)) if is_distributed() else None
+    is_main = rank() == 0
+    if not is_main:
+        log = lambda line: None  # noqa: E731
 
     step, history = 0, []
     if resume:
@@ -121,6 +151,7 @@ def pretrain(
         batches.load_state_dict(ckpt["batches"])
         step, history = ckpt["step"], ckpt["history"]
         log(f"resumed from {checkpoint_path} at step {step}")
+    broadcast_parameters(model)  # replicas start identical
 
     def run_eval() -> None:
         val_loss = evaluate(
@@ -130,7 +161,7 @@ def pretrain(
             device,
         )
         history.append({"step": step, "train_loss": train_loss, "val_loss": val_loss})
-        if checkpoint_path is not None:
+        if checkpoint_path is not None and is_main:
             save_checkpoint(
                 checkpoint_path,
                 model,
@@ -154,22 +185,25 @@ def pretrain(
         f"{precision.name}, {config.total_steps} steps x {config.batch_size} x "
         f"{config.seq_len} tokens"
         + (f" ({config.grad_accum_steps} micro-batches)" if config.grad_accum_steps > 1 else "")
+        + (f", data parallel over {world_size()} processes" if is_distributed() else "")
     )
     start = time.perf_counter()
     train_loss = float("nan")
     while step < config.total_steps:
         idx, targets = batches.next()
-        train_loss = train_step(
+        local_loss = train_step(
             model,
-            idx.to(device),
-            targets.to(device),
+            idx[row_start:row_stop].to(device),
+            targets[row_start:row_stop].to(device),
             optimizer,
             precision,
             scaler,
             scheduler,
             config.max_grad_norm,
             config.grad_accum_steps,
+            grad_sync,
         )
+        (train_loss,) = all_reduce_sum(local_loss * share) if is_distributed() else (local_loss,)
         step += 1
         elapsed = time.perf_counter() - start
         if step % config.eval_interval == 0 or step == config.total_steps:

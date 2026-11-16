@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from torch import nn
 
@@ -16,6 +18,7 @@ def train_step(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     max_grad_norm: float | None = None,
     grad_accum_steps: int = 1,
+    grad_sync: Callable[[], None] | None = None,
 ) -> float:
     """One optimizer update with mixed precision and gradient accumulation;
     returns the loss on the whole batch.
@@ -32,6 +35,10 @@ def train_step(
     scaled for fp16 (scaler is a no-op otherwise) and gradients are
     unscaled before clipping, so max_grad_norm applies to the true
     gradients. If fp16 gradients overflowed, the scaler skips the update.
+
+    grad_sync, if given, is called once the batch's gradients are complete
+    and before clipping (data-parallel training averages them across
+    processes there).
     """
     batch = idx.shape[0]
     if not 1 <= grad_accum_steps <= batch:
@@ -47,6 +54,8 @@ def train_step(
             _, loss = model(idx_mb, targets_mb)
         scaler.scale(loss * weight).backward()
         total += loss.item() * weight
+    if grad_sync is not None:
+        grad_sync()
     if max_grad_norm is not None:
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
