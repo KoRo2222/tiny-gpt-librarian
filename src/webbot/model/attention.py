@@ -13,10 +13,10 @@ KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
 def attention_weights(scores: torch.Tensor) -> torch.Tensor:
-    """Softmax over keys, computed in float32 even under bf16/fp16 autocast
+    """Softmax over keys, computed in (at least) float32 even under bf16/fp16 autocast
     (CPU autocast would otherwise keep it in bf16, where exp() of
     low-precision scores loses most of the small attention weights)."""
-    return scores.float().softmax(dim=-1)
+    return scores.to(torch.promote_types(scores.dtype, torch.float32)).softmax(dim=-1)
 
 
 class CausalSelfAttention(nn.Module):

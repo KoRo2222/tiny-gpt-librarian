@@ -152,8 +152,9 @@ class GPT(nn.Module):
         logits, _ = self.forward_with_cache(idx)
         loss = None
         if targets is not None:
-            # log-softmax over the vocab in float32 even under autocast.
-            loss = F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten())
+            # log-softmax over the vocab in (at least) float32 even under autocast.
+            logits32 = logits.to(torch.promote_types(logits.dtype, torch.float32))
+            loss = F.cross_entropy(logits32.flatten(0, 1), targets.flatten())
             if self.training and self.config.n_experts > 0:
                 loss = loss + self.config.moe_aux_coef * self.moe_aux_loss()
         return logits, loss

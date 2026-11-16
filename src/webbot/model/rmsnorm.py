@@ -22,6 +22,6 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Compute the statistic in float32 even for half-precision inputs:
         # squaring small values in fp16/bf16 loses precision.
-        x32 = x.float()
+        x32 = x.to(torch.promote_types(x.dtype, torch.float32))
         normed = x32 * torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return normed.to(x.dtype) * self.weight.to(x.dtype)
