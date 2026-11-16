@@ -4,6 +4,7 @@ from .precision import Precision, resolve_precision
 from .pretrain import PretrainConfig, evaluate, make_optimizer, pretrain
 from .schedule import d2z_multiplier, d2z_scheduler
 from .step import train_step
+from .zero import ZeroOptimizer
 
 __all__ = [
     "all_reduce_gradients",
@@ -24,4 +25,5 @@ __all__ = [
     "save_checkpoint",
     "train_step",
     "world_size",
+    "ZeroOptimizer",
 ]

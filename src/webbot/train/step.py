@@ -58,7 +58,11 @@ def train_step(
         grad_sync()
     if max_grad_norm is not None:
         scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        # A sharded optimizer (ZeRO) holds the gradients and clips them itself.
+        if hasattr(optimizer, "clip_grad_norm_"):
+            optimizer.clip_grad_norm_(max_grad_norm)
+        else:
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
     scaler.step(optimizer)
     scaler.update()
     if scheduler is not None:

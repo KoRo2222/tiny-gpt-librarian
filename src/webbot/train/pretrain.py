@@ -25,6 +25,7 @@ from .distributed import (
 )
 from .precision import Precision, resolve_precision
 from .schedule import d2z_scheduler
+from .zero import ZeroOptimizer
 from .step import train_step
 
 
@@ -33,6 +34,7 @@ class PretrainConfig:
     total_steps: int
     batch_size: int = 16  # sequences per optimizer update
     grad_accum_steps: int = 1  # micro-batches the batch is split into
+    zero_stage: int = 0  # 0: plain AdamW; 1/2: ZeRO-sharded AdamW (see zero.py)
     seq_len: int = 256
     peak_lr: float = 1e-3
     warmup_steps: int = 100
@@ -122,6 +124,11 @@ def pretrain(
     averaged across ranks before each step, and the result equals a single
     process training on the whole batch. Only rank 0 logs and writes
     checkpoints; every rank must be given the same arguments.
+
+    zero_stage 1 or 2 shards the optimizer state (and, for 2, the
+    gradients) across the ranks instead of replicating them (ZeRO). Its
+    checkpoints hold the gathered state, so a run can resume with a
+    different number of processes.
     """
     if config.seq_len > model.config.max_seq_len:
         raise ValueError(
@@ -130,13 +137,26 @@ def pretrain(
     torch.manual_seed(config.seed)
     model.to(device).train()
     precision = resolve_precision(device, config.precision)
-    optimizer = make_optimizer(model, config.peak_lr, config.weight_decay, config.betas)
-    scheduler = d2z_scheduler(optimizer, config.total_steps, config.warmup_steps)
+    if config.zero_stage:
+        if precision.name == "fp16":
+            raise ValueError("ZeRO is not combined with fp16 loss scaling")
+        optimizer = ZeroOptimizer(
+            model, config.peak_lr, config.weight_decay, config.betas, config.zero_stage
+        )
+        scheduler = d2z_scheduler(optimizer.optimizer, config.total_steps, config.warmup_steps)
+    else:
+        optimizer = make_optimizer(model, config.peak_lr, config.weight_decay, config.betas)
+        scheduler = d2z_scheduler(optimizer, config.total_steps, config.warmup_steps)
     scaler = precision.make_grad_scaler()
     batches = RandomBatches(train_tokens, config.seq_len, config.batch_size, config.seed)
     row_start, row_stop = local_rows(config.batch_size)
     share = (row_stop - row_start) / config.batch_size
-    grad_sync = (lambda: all_reduce_gradients(model, share)) if is_distributed() else None
+    if config.zero_stage:
+        grad_sync = lambda: optimizer.reduce_gradients(share)  # noqa: E731
+    elif is_distributed():
+        grad_sync = lambda: all_reduce_gradients(model, share)  # noqa: E731
+    else:
+        grad_sync = None
     is_main = rank() == 0
     if not is_main:
         log = lambda line: None  # noqa: E731
@@ -161,11 +181,13 @@ def pretrain(
             device,
         )
         history.append({"step": step, "train_loss": train_loss, "val_loss": val_loss})
+        # Gathering a sharded optimizer's state is collective: all ranks call it.
+        opt_state = optimizer.state_dict() if checkpoint_path is not None else None
         if checkpoint_path is not None and is_main:
             save_checkpoint(
                 checkpoint_path,
                 model,
-                optimizer=optimizer,
+                optimizer=opt_state,
                 scheduler=scheduler,
                 scaler=scaler,
                 batches=batches,
