@@ -80,10 +80,21 @@ class _Desc:
 
 
 def learn_merges(
-    word_freqs: dict[tuple[Symbol | None, ...], int], num_merges: int
+    word_freqs: dict[tuple[Symbol | None, ...], int],
+    num_merges: int,
+    min_pair_count: int = 1,
 ) -> list[Pair]:
     """Up to num_merges merges, each the pair with the highest
-    count(a, b) / (count(a) * count(b)); ties go to the larger pair.
+    count(a, b) / (count(a) * count(b)) among pairs occurring at least
+    min_pair_count times; ties go to the larger pair.
+
+    The score alone favors pairs that are rare but never occur apart (on
+    Japanese Wikipedia the first merges are rare kanji compounds and the
+    result stays almost character-level); a minimum count leaves those out.
+    Counts change as merges are made, and every count change re-scores the
+    pair; only pairs at or above the minimum enter the heap (a rare pair
+    with a high score would otherwise be pushed and discarded again after
+    every merge that touches one of its symbols).
 
     Counts are kept up to date incrementally (only words containing the
     merged pair change). A pair's score also depends on its symbols'
@@ -111,7 +122,8 @@ def learn_merges(
     def score(p: Pair) -> float:
         return pair_count[p] / (sym_count[p[0]] * sym_count[p[1]])
 
-    heap = [(-score(p), _Desc(p)) for p in pair_count]
+    min_count = max(1, min_pair_count)
+    heap = [(-score(p), _Desc(p)) for p, c in pair_count.items() if c >= min_count]
     heapq.heapify(heap)
 
     merges: list[Pair] = []
@@ -120,7 +132,7 @@ def learn_merges(
         while heap:
             neg, desc = heapq.heappop(heap)
             p = desc.pair
-            if pair_count.get(p, 0) > 0 and score(p) == -neg:
+            if pair_count.get(p, 0) >= min_count and score(p) == -neg:
                 best = p
                 break
         if best is None:
@@ -156,9 +168,10 @@ def learn_merges(
         for s in best:
             changed |= sym_to_pairs.get(s, set())
         for p in changed:
-            if pair_count.get(p, 0) > 0:
+            count = pair_count.get(p, 0)
+            if count >= min_count:
                 heapq.heappush(heap, (-score(p), _Desc(p)))
-            else:
+            elif count <= 0:
                 pair_count.pop(p, None)
         merges.append(best)
     return merges
@@ -188,8 +201,12 @@ class WordPieceTokenizer(Tokenizer):
         num_workers: int = 1,
         piece_chars: int = 1 << 20,
         character_coverage: float = 0.9995,
+        min_pair_count: int = 100,
     ) -> None:
         """Learn the vocabulary from documents (texts as for count_pretokens).
+
+        Only pairs occurring at least min_pair_count times in the corpus are
+        merged (1 gives standard WordPiece; see learn_merges).
 
         vocab_size counts everything: 256 byte ids + alphabet + merged
         pieces + SPECIAL_TOKENS. The alphabet holds every character (in the
@@ -213,7 +230,7 @@ class WordPieceTokenizer(Tokenizer):
                 f"the alphabet needs {len(initial)} symbols for coverage "
                 f"{character_coverage}, but only {budget} fit"
             )
-        merges = learn_merges(word_freqs, budget - len(initial))
+        merges = learn_merges(word_freqs, budget - len(initial), min_pair_count)
         self._build(initial + [merge_symbols(*p) for p in merges])
 
     def _build(self, tokens: list[Symbol], special_tokens: Iterable[str] | None = None) -> None:

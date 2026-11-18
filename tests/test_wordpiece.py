@@ -28,8 +28,9 @@ def _word_freqs(texts, coverage=1.0):
     return freqs
 
 
-def _reference_merges(word_freqs, num_merges):
-    """Naive WordPiece: recount every symbol and pair before each merge."""
+def _reference_merges(word_freqs, num_merges, min_pair_count=1):
+    """Naive WordPiece: recount every symbol and pair before each merge;
+    only pairs occurring at least min_pair_count times are candidates."""
     words = dict(word_freqs)
     merges = []
     for _ in range(num_merges):
@@ -41,6 +42,7 @@ def _reference_merges(word_freqs, num_merges):
             for a, b in zip(w, w[1:]):
                 if a is not None and b is not None:
                     pairs[(a, b)] += f
+        pairs = Counter({p: c for p, c in pairs.items() if c >= min_pair_count})
         if not pairs:
             break
         best = max(pairs, key=lambda p: (pairs[p] / (sym[p[0]] * sym[p[1]]), p))
@@ -75,7 +77,8 @@ def test_incremental_training_matches_full_recount():
     ]
     for texts, coverage in corpora:
         wf = _word_freqs(texts, coverage)
-        assert learn_merges(wf, 500) == _reference_merges(wf, 500)
+        for min_count in (1, 3, 10):
+            assert learn_merges(wf, 500, min_count) == _reference_merges(wf, 500, min_count)
 
 
 def test_merges_by_score_not_frequency():
@@ -87,6 +90,31 @@ def test_merges_by_score_not_frequency():
         ((False, "x"), (True, "y")): 1,
     }
     assert learn_merges(wf, 1) == [((False, "x"), (True, "y"))]
+
+
+def test_min_pair_count_leaves_out_rare_pairs():
+    # Same corpus as above: with a minimum of 5 occurrences the rare,
+    # high-scoring (x, ##y) is out and the frequent (a, ##b) is merged.
+    wf = {
+        ((False, "a"), (True, "b")): 10,
+        ((False, "a"),): 100,
+        ((False, "x"), (True, "y")): 1,
+    }
+    assert learn_merges(wf, 5, min_pair_count=5) == [((False, "a"), (True, "b"))]
+
+
+def test_pair_becomes_eligible_once_merges_make_it_frequent():
+    # (ab, ##c) does not exist before a+##b is merged; then it occurs 6
+    # times: second merge with a minimum of 5, never with a minimum of 7.
+    # (x and y occur alone a lot, so their pairs score low.)
+    alphabet = set("abcxy")
+    words = {"ab": 10, "abc": 6, "xb": 30, "yc": 30, "x": 100, "y": 100}
+    wf = {tuple(split_word(w, alphabet)): f for w, f in words.items()}
+    ab, abc = ((False, "a"), (True, "b")), ((False, "ab"), (True, "c"))
+    assert learn_merges(wf, 2, min_pair_count=5) == [ab, abc] == _reference_merges(wf, 2, 5)
+    with_7 = learn_merges(wf, 10, min_pair_count=7)
+    assert with_7[0] == ab and abc not in with_7
+    assert with_7 == _reference_merges(wf, 10, 7)
 
 
 def test_barrier_chars_never_merge():
@@ -136,10 +164,22 @@ def test_each_step_takes_the_longest_match():
         assert i == len(word)
 
 
-def _trained(vocab_size=400, corpus=JA_CORPUS * 3, **kw):
+def _trained(vocab_size=400, corpus=JA_CORPUS * 3, min_pair_count=1, **kw):
+    # These corpora are tiny: standard WordPiece (no minimum) by default.
     tok = WordPieceTokenizer()
-    tok.train(corpus, vocab_size=vocab_size, **kw)
+    tok.train(corpus, vocab_size=vocab_size, min_pair_count=min_pair_count, **kw)
     return tok
+
+
+def test_default_minimum_merges_only_frequent_pairs():
+    # "王様" occurs 150 times, every other pair far fewer: with the default
+    # minimum of 100 only 王+##様 is merged.
+    corpus = ["王様"] * 150 + JA_CORPUS
+    tok = WordPieceTokenizer()
+    tok.train(corpus, vocab_size=400)
+    merged = [t for t in tok.tokens if len(t[1]) > 1]
+    assert merged == [(False, "王様")]
+    assert tok.encode("王様") == [tok.vocab[(False, "王様")]]
 
 
 def test_vocab_size_and_id_layout():
