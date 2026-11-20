@@ -42,14 +42,18 @@ class Precision:
 def resolve_precision(device: str | torch.device, name: str = "auto") -> Precision:
     """Pick a Precision for device. name is "auto", "fp32", "bf16" or "fp16".
 
-    auto: bf16 on GPUs that support it, else fp16 on GPU; fp32 on CPU,
-    where bf16 is only faster with native bf16 instructions (AMX /
-    AVX512-BF16) and otherwise just costs accuracy.
+    auto: bf16 on GPUs with bf16 tensor cores (compute capability 8.0+,
+    Ampere and later), else fp16 on GPU (e.g. a T4); fp32 on CPU, where
+    bf16 is only faster with native bf16 instructions (AMX / AVX512-BF16)
+    and otherwise just costs accuracy. torch.cuda.is_bf16_supported() is
+    not used: it also reports True when bf16 is merely emulated (slowly).
     """
     device_type = torch.device(device).type
     if name == "auto":
         if device_type == "cuda":
-            name = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+            index = torch.device(device).index
+            major, _ = torch.cuda.get_device_capability(index)
+            name = "bf16" if major >= 8 else "fp16"
         else:
             name = "fp32"
     if name not in _DTYPES:

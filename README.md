@@ -19,7 +19,7 @@ src/webbot/tokenizer/
   wordpiece.py     WordPiece(BERT方式、## 付きの続きピース、バイトフォールバック付き)
 src/webbot/model/
   gpt.py           LLaMA方式のGPT(RoPE・RMSNorm・SwiGLU・Pre-Norm、KVキャッシュ付き生成)
-  attention.py     因果Self-Attention(GQA対応、素朴な実装 / Flash Attention を切り替え)
+  attention.py     因果Self-Attention(GQA対応、素朴な実装 / Flash Attention / PyTorchのSDPA を切り替え)
   flash_attention.py  Flash Attention(タイル分割とオンラインsoftmax、逆伝播は再計算)
   moe.py           Mixture of Experts(上位k個の専門家に振り分けるFFN、負荷分散の補助損失)
   compile.py       torch.compile の準備(WindowsでMSVCの環境を読み込む)とモデルのコンパイル
@@ -44,6 +44,9 @@ scripts/
   prepare_data.py  事前学習データを作る
   build_index.py   段落の検索索引を作る
   eval_retrieval.py  検索を評価する
+  pretrain.py      事前学習(--resume で中断した続きから)
+notebooks/
+  pretrain_colab.ipynb  Google Colab(GPU)で事前学習するノートブック
 rust/              BPEの学習とエンコードのRust実装(PyO3 + maturin、モジュール名 webbot_bpe)
 tests/             テスト
 ```
@@ -113,6 +116,7 @@ tests/             テスト
   - 既定の `None` は `n_heads` と同じで、通常のMulti-Head Attentionです。`1` にするとMulti-Query Attentionになります
   - K/Vの射影とKVキャッシュが、グループの大きさの分だけ小さくなります。計算ではK/Vをグループ方向にブロードキャストし、クエリヘッドの数だけ複製することはしません。素朴な実装とFlash Attentionの両方で使えます
   - テストでは、「K/Vの重みをグループ内のヘッドに複製した通常のMulti-Head」と出力・勾配が一致すること(共有したK/Vの重みの勾配は、複製した分の合計になります)を確かめています。ほかに、KVキャッシュがK/Vヘッドの数だけで持たれること、パラメータの減り方、モデル全体で素朴な実装とFlash Attentionが一致することも確かめています
+- **SDPA**(`GPTConfig(attn_impl="sdpa")`): PyTorchの融合カーネル `scaled_dot_product_attention` を使います。GPUではFlashAttentionなどのカーネルが使われ、このCPUでも最速でした。GQAは `enable_gqa` でK/Vを複製せずに渡します。KVキャッシュの後に複数のトークンをまとめて入れるときは、`is_causal=True` のマスク(クエリとキーの先頭がそろっている前提)が合わないので、位置から作ったマスクを渡します。テストでは、素朴な実装と出力・勾配がfloat64で一致すること、キャッシュの後に何トークンずつ入れてもキャッシュなしと一致することを確かめています
 - **Mixture of Experts**(`GPTConfig(n_experts=..., moe_top_k=..., moe_aux_coef=...)`): 各ブロックのFFNを、E個のSwiGLU(専門家)とルーター(線形層)に置き換えます。各トークンは、ルーターの確率が高い上位k個の専門家だけを通り、その出力をゲートの重みで足し合わせます(Shazeer et al. 2017、Switch Transformer、Mixtral)
   - ゲートは、k=1ならルーターの確率そのもの(Switch方式。ルーターが本来の損失からも学べます)、k≥2なら上位k個の確率を合計1に正規化したもの(Mixtral方式)です
   - 容量の上限はなく、トークンを捨てることはありません。計算は専門家ごとにトークンをまとめて行います
@@ -133,7 +137,7 @@ tests/             テスト
 
 ### 学習
 
-- 2作目(storybot)の事前学習ループを引き継いでいます。AdamW(重み減衰は行列だけ)、D2Z(線形ウォームアップの後、最後のステップで0まで線形に下げる学習率)、混合精度(CPUではfp32)、勾配クリップです。チェックポイントには、モデル・オプティマイザー・スケジューラー・バッチの乱数まで保存するので、中断してから再開しても、中断しなかった場合と同じ結果になります
+- 2作目(storybot)の事前学習ループを引き継いでいます。AdamW(重み減衰は行列だけ)、D2Z(線形ウォームアップの後、最後のステップで0まで線形に下げる学習率)、混合精度、勾配クリップです。混合精度の自動選択は、CPUではfp32、GPUではbf16の演算器を持つ世代(Ampere以降)ならbf16、それより前(T4など)ならfp16です(`torch.cuda.is_bf16_supported()` はbf16をソフトウェアで代わりに計算できるだけのGPUでもTrueを返すので使いません)。チェックポイントには、モデル・オプティマイザー・スケジューラー・バッチの乱数まで保存するので、中断してから再開しても、中断しなかった場合と同じ結果になります
 - **勾配累積**(`PretrainConfig(batch_size=B, grad_accum_steps=k)`): 1回の更新のバッチ B を k 個のマイクロバッチに分け、順に順伝播・逆伝播して勾配を足し合わせ、オプティマイザーの更新は1回だけ行います。メモリはマイクロバッチ1つ分で済みます
   - 各マイクロバッチの損失は、バッチに占める行数の割合で重み付けします。そのため、B が k で割り切れない場合(6行を4つに分けて2・2・1・1行など)も、勾配はバッチ全体の平均の損失の勾配と一致します
   - 勾配のクリップは、全マイクロバッチの勾配を足した後に1回だけ行います。fp16の損失スケーリングとも組み合わせられます
@@ -393,7 +397,7 @@ tests/             テスト
 - 400ステップの時点で、Muonの方が0.044低くなりました。AdamWが400ステップでたどり着いた損失(3.197)に、Muonは約350ステップで届いています
 - 一方、1ステップの時間はMuonの方が19%長くかかりました(834ms→991ms。オプティマイザーの更新だけで19ms→137ms)。Newton-Schulzの行列積のためです。この規模では、かかった時間あたりで見るとAdamWとほぼ同じでした
 
-jawikiでの事前学習、検索→読む→答えるの学習(SFT)、JSQuADでの評価はこれから実装します。
+jawikiでの事前学習は、Google Colab(GPU)で実行する準備まで済んでいます(`notebooks/pretrain_colab.ipynb`。まだ実行していません)。検索→読む→答えるの学習(SFT)、JSQuADでの評価はこれから実装します。
 
 ## セットアップ
 
@@ -408,6 +412,14 @@ python -m venv .venv
 ```
 
 Rust版をビルドしなくても、Python版だけで動きます(`backend="python"`)。ただし、Rust版のテストは失敗します。
+
+**Google Colabで事前学習する**: [notebooks/pretrain_colab.ipynb](https://colab.research.google.com/github/KoRo2222/tiny-gpt-librarian/blob/master/notebooks/pretrain_colab.ipynb) を開き、ランタイムを T4 GPU にして上から順に実行します。jawikiのダウンロードとデータの準備はColabの上で行い、トークン列のファイルとチェックポイントは Googleドライブ(`MyDrive/webbot/`)に保存します。接続が切れたら同じ手順で実行し直すと、チェックポイントの続きから再開します。最初に50ステップの試運転をして、1ステップの時間から学習全体の時間の見込みを表示します。
+
+手元で学習するときは、次のようにします(`--resume` を付けておけば、中断した後に同じコマンドで続きから再開します)。
+
+```
+.venv\Scripts\python scripts\pretrain.py --data data/jawiki --out runs/base --steps 20000 --resume
+```
 
 データは Hugging Face から parquet をダウンロードして置きます(`data/` 以下は git の管理外です)。
 

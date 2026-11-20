@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .flash_attention import flash_attention
@@ -30,7 +31,9 @@ class CausalSelfAttention(nn.Module):
 
     attn_impl "naive" builds the full masked score matrix; "flash" computes
     the same attention tile by tile (flash_attention), keeping memory linear
-    in sequence length.
+    in sequence length; "sdpa" calls PyTorch's fused
+    scaled_dot_product_attention (FlashAttention / memory-efficient kernels
+    on a GPU; the fastest choice on this CPU too).
 
     Grouped-query attention (GQA): there are n_kv_heads key/value heads
     (n_heads by default, i.e. ordinary multi-head attention; 1 is
@@ -54,7 +57,7 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(f"d_model {d_model} not divisible by n_heads {n_heads}")
         if n_kv_heads < 1 or n_heads % n_kv_heads != 0:
             raise ValueError(f"n_heads {n_heads} not divisible by n_kv_heads {n_kv_heads}")
-        if attn_impl not in ("naive", "flash"):
+        if attn_impl not in ("naive", "flash", "sdpa"):
             raise ValueError(f"unknown attn_impl {attn_impl!r}")
         self.attn_impl = attn_impl
         self.n_heads = n_heads
@@ -82,6 +85,11 @@ class CausalSelfAttention(nn.Module):
             k = torch.cat((kv_cache[0], k), dim=2)
             v = torch.cat((kv_cache[1], v), dim=2)
 
+        if self.attn_impl == "sdpa":
+            y = self._sdpa(q, k, v, past_len)
+            y = y.transpose(1, 2).reshape(batch, seq_len, d_model)
+            return self.out(y), (k, v)
+
         # Group the query heads: q (batch, n_kv, group, seq, hd) against
         # k/v (batch, n_kv, 1, past+seq, hd), broadcast over the group.
         qg = q.unflatten(1, (self.n_kv_heads, -1))
@@ -100,3 +108,23 @@ class CausalSelfAttention(nn.Module):
 
         y = y.flatten(1, 2).transpose(1, 2).reshape(batch, seq_len, d_model)
         return self.out(y), (k, v)
+
+    def _sdpa(self, q, k, v, past_len: int) -> torch.Tensor:
+        """F.scaled_dot_product_attention with the cache-aware causal mask.
+
+        is_causal=True aligns the mask at the top left (query i sees keys
+        0..i), right only without a cache; after a cache, query i sits at
+        position past_len + i, so the mask is passed explicitly (a single
+        new token sees every key and needs none). enable_gqa lets query
+        head h use key/value head h // group without copying k and v.
+        """
+        seq_len = q.shape[2]
+        gqa = self.n_kv_heads != self.n_heads
+        if past_len == 0:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=gqa)
+        mask = None
+        if seq_len > 1:
+            q_pos = torch.arange(past_len, past_len + seq_len, device=q.device)
+            k_pos = torch.arange(past_len + seq_len, device=q.device)
+            mask = k_pos[None, :] <= q_pos[:, None]  # True = may attend
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=gqa)

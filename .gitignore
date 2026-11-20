@@ -7,3 +7,4 @@ CLAUDE.md
 rust/target/
 *.pyd
 /wandb/
+/runs/

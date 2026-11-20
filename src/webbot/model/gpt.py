@@ -30,7 +30,7 @@ class GPTConfig:
     rope_scaling: str | None = None
     rope_factor: float = 1.0
     rope_original_max_seq_len: int | None = None
-    attn_impl: str = "naive"  # "naive" or "flash" (see CausalSelfAttention)
+    attn_impl: str = "naive"  # "naive", "flash" or "sdpa" (see CausalSelfAttention)
     # Mixture of experts: n_experts > 0 replaces every block's FFN with an
     # MoE of that many SwiGLU experts (each of ffn_hidden_dim), top-k routed.
     n_experts: int = 0

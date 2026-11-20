@@ -34,6 +34,15 @@ def test_resolve_precision():
         resolve_precision("cpu", "fp8")
 
 
+def test_auto_on_gpu_picks_bf16_only_with_bf16_hardware(monkeypatch):
+    # A T4 (compute capability 7.5) can emulate bf16 and is_bf16_supported()
+    # says True, but only fp16 runs on its tensor cores.
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda *a, **k: True)
+    for capability, expected in [((7, 5), "fp16"), ((7, 0), "fp16"), ((8, 0), "bf16"), ((9, 0), "bf16")]:
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None, c=capability: c)
+        assert resolve_precision("cuda").name == expected, capability
+
+
 def test_loss_scaling_only_for_fp16():
     for name, enabled in (("fp32", False), ("bf16", False), ("fp16", True)):
         assert resolve_precision("cpu", name).make_grad_scaler().is_enabled() == enabled
