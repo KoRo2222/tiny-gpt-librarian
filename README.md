@@ -53,7 +53,9 @@ scripts/
   pretrain.py      事前学習(--resume で中断した続きから)
   make_sft_data.py SFTデータを作る
   sft.py           SFT(--resume で中断した続きから)と、評価用の質問での完全一致
+  run_pipeline.py  データ準備から評価までを1回で通す(済んだ段階は飛ばし、時間切れでも正常に終わる)
 notebooks/
+  kaggle_pipeline.ipynb  Kaggleで全段階を自動で実行するノートブック(PCを閉じても進む)
   pretrain_colab.ipynb  Google Colab(GPU)で事前学習するノートブック
   sft_colab.ipynb       Google Colab(GPU)でSFTするノートブック
 rust/              BPEの学習とエンコードのRust実装(PyO3 + maturin、モジュール名 webbot_bpe)
@@ -446,6 +448,8 @@ python -m venv .venv
 ```
 
 Rust版をビルドしなくても、Python版だけで動きます(`backend="python"`)。ただし、Rust版のテストは失敗します。
+
+**Kaggleで全段階を自動で実行する**(おすすめ): Kaggleで [notebooks/kaggle_pipeline.ipynb](notebooks/kaggle_pipeline.ipynb) を読み込み、Accelerator を GPU(T4 x2 または P100)、Internet を On にして、「Save Version」→「Save & Run All (Commit)」で実行します。実行はKaggleのサーバーで続くので、ブラウザもPCも閉じてかまいません。`scripts/run_pipeline.py` がデータの準備(jawiki全22シャードのダウンロードを含む)→ 事前学習 → 検索の索引 → SFTデータ → SFTと評価を順に行い、結果はノートブックの Output に出ます。Kaggleの1回の上限(12時間)より前に学習を止めて正常に終わるので、続きは前回の出力を入力に追加して実行し直せば再開します。
 
 **Google Colabで事前学習する**: [notebooks/pretrain_colab.ipynb](https://colab.research.google.com/github/KoRo2222/tiny-gpt-librarian/blob/master/notebooks/pretrain_colab.ipynb) を開き、ランタイムを T4 GPU にして上から順に実行します。jawikiのダウンロードとデータの準備はColabの上で行い、トークン列のファイルとチェックポイントは Googleドライブ(`MyDrive/webbot/`)に保存します。接続が切れたら同じ手順で実行し直すと、チェックポイントの続きから再開します。最初に50ステップの試運転をして、1ステップの時間から学習全体の時間の見込みを表示します。
 
