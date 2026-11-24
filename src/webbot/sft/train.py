@@ -31,10 +31,15 @@ IGNORE = -100
 Encoded = tuple[list[int], list[bool]]
 
 
-def make_batch(examples: Sequence[Encoded], pad_id: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """(input ids, targets), both (batch, longest - 1): targets are the next
-    tokens where the model writes them, IGNORE elsewhere and on padding."""
+def make_batch(
+    examples: Sequence[Encoded], pad_id: int, pad_multiple: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(input ids, targets), both (batch, width - 1): targets are the next
+    tokens where the model writes them, IGNORE elsewhere and on padding.
+    width is the longest example, rounded up to pad_multiple (on XLA devices
+    every new width compiles a new graph; rounding keeps them few)."""
     width = max(len(ids) for ids, _ in examples)
+    width = -(-(width - 1) // pad_multiple) * pad_multiple + 1
     idx = torch.full((len(examples), width), pad_id, dtype=torch.long)
     tgt = torch.full((len(examples), width), IGNORE, dtype=torch.long)
     for row, (ids, mask) in enumerate(examples):
@@ -47,17 +52,19 @@ def make_batch(examples: Sequence[Encoded], pad_id: int) -> tuple[torch.Tensor, 
 class SFTBatches:
     """Endless random batches of encoded examples, resumable."""
 
-    def __init__(self, examples: Sequence[Encoded], batch_size: int, pad_id: int, seed: int = 0):
+    def __init__(self, examples: Sequence[Encoded], batch_size: int, pad_id: int, seed: int = 0,
+                 pad_multiple: int = 1):
         if not examples:
             raise ValueError("no examples")
         self.examples = examples
         self.batch_size = batch_size
         self.pad_id = pad_id
+        self.pad_multiple = pad_multiple
         self.rng = np.random.default_rng(seed)
 
     def next(self) -> tuple[torch.Tensor, torch.Tensor]:
         rows = self.rng.integers(0, len(self.examples), size=self.batch_size)
-        return make_batch([self.examples[i] for i in rows], self.pad_id)
+        return make_batch([self.examples[i] for i in rows], self.pad_id, self.pad_multiple)
 
     def state_dict(self) -> dict:
         return {"rng": self.rng.bit_generator.state}
@@ -69,7 +76,7 @@ class SFTBatches:
 @torch.no_grad()
 def evaluate_sft(
     model: nn.Module, examples: Sequence[Encoded], pad_id: int, batch_size: int,
-    precision, device: str | torch.device = "cpu",
+    precision, device: str | torch.device = "cpu", pad_multiple: int = 1,
 ) -> float:
     """Mean loss over every written token of the examples (token-weighted,
     in order), in eval mode."""
@@ -77,7 +84,7 @@ def evaluate_sft(
     model.eval()
     total, count = 0.0, 0
     for start in range(0, len(examples), batch_size):
-        idx, tgt = make_batch(examples[start : start + batch_size], pad_id)
+        idx, tgt = make_batch(examples[start : start + batch_size], pad_id, pad_multiple)
         with precision.autocast():
             logits, _ = model(idx.to(device))
         logits = logits.float()
@@ -87,7 +94,7 @@ def evaluate_sft(
         ).item()
         count += int((tgt != IGNORE).sum())
     model.train(was_training)
-    return total / count
+    return total / count if count else float("nan")  # no examples: nothing to measure
 
 
 @dataclass
@@ -103,6 +110,7 @@ class SFTConfig:
     eval_interval: int = 200
     precision: str = "auto"
     seed: int = 0
+    pad_multiple: int = 1  # round batch widths up to this (use e.g. 128 on TPUs)
 
 
 def train_sft(
@@ -126,7 +134,7 @@ def train_sft(
     optimizer = make_optimizer(model, config.peak_lr, config.weight_decay, config.betas)
     scheduler = d2z_scheduler(optimizer, config.total_steps, config.warmup_steps)
     scaler = precision.make_grad_scaler()
-    batches = SFTBatches(train_examples, config.batch_size, pad_id, config.seed)
+    batches = SFTBatches(train_examples, config.batch_size, pad_id, config.seed, config.pad_multiple)
     step, history = 0, []
     if resume:
         ckpt = load_checkpoint(checkpoint_path, device)
@@ -146,7 +154,8 @@ def train_sft(
                                 scheduler, config.max_grad_norm, config.grad_accum_steps)
         step += 1
         if step % config.eval_interval == 0 or step == config.total_steps:
-            val_loss = evaluate_sft(model, val_examples, pad_id, config.batch_size, precision, device)
+            val_loss = evaluate_sft(model, val_examples, pad_id, config.batch_size, precision, device,
+                                    config.pad_multiple)
             history.append({"step": step, "train_loss": train_loss, "val_loss": val_loss})
             if checkpoint_path is not None:
                 save_checkpoint(checkpoint_path, model, optimizer=optimizer, scheduler=scheduler,

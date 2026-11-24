@@ -5,6 +5,7 @@ from collections.abc import Callable
 import torch
 from torch import nn
 
+from .device import xla_step
 from .precision import Precision
 
 
@@ -45,7 +46,9 @@ def train_step(
         raise ValueError(f"grad_accum_steps must be in 1..batch size ({batch})")
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    total = 0.0
+    # The loss is read once, after the update: on XLA devices reading a value
+    # forces execution, so the whole step stays one compiled graph.
+    total = None
     for idx_mb, targets_mb in zip(
         idx.tensor_split(grad_accum_steps), targets.tensor_split(grad_accum_steps)
     ):
@@ -53,7 +56,8 @@ def train_step(
         with precision.autocast():
             _, loss = model(idx_mb, targets_mb)
         scaler.scale(loss * weight).backward()
-        total += loss.item() * weight
+        part = loss.detach() * weight  # the loss is already >= float32
+        total = part if total is None else total + part
     if grad_sync is not None:
         grad_sync()
     if max_grad_norm is not None:
@@ -67,4 +71,5 @@ def train_step(
     scaler.update()
     if scheduler is not None:
         scheduler.step()
-    return total
+    xla_step(idx.device)
+    return total.item()

@@ -23,7 +23,7 @@ from webbot.sft import encode_example, load_jsonl  # noqa: E402
 from webbot.sft.infer import exact_match, generate_answer, normalize_answer  # noqa: E402
 from webbot.sft.train import SFTConfig, train_sft  # noqa: E402
 from webbot.tokenizer import BPETokenizer  # noqa: E402
-from webbot.train import load_checkpoint  # noqa: E402
+from webbot.train import is_xla, load_checkpoint, resolve_device  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,7 +59,7 @@ def main(argv: list[str] | None = None) -> dict:
         log_file.write(line + "\n")
         log_file.flush()
 
-    device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
+    device = resolve_device(args.device)
     tokenizer = BPETokenizer.load(args.tokenizer)
     resume = args.resume and ckpt_path.exists()
     init = load_checkpoint(ckpt_path if resume else args.init, "cpu")
@@ -80,13 +80,16 @@ def main(argv: list[str] | None = None) -> dict:
     pad_id = tokenizer.special_tokens[tokenizer.PAD_TOKEN]
     config = SFTConfig(total_steps=args.steps, batch_size=args.batch_size, peak_lr=args.lr,
                        warmup_steps=args.warmup, grad_accum_steps=args.grad_accum,
-                       eval_interval=args.eval_interval, precision=args.precision, seed=args.seed)
+                       eval_interval=args.eval_interval, precision=args.precision, seed=args.seed,
+                       pad_multiple=128 if is_xla(device) else 1)
     history = train_sft(model, encoded("train"), encoded("val", args.val_examples), pad_id, config,
                         device=device, checkpoint_path=ckpt_path, resume=resume, log=log)
 
     result = {"history": history}
-    if args.test_examples > 0:
-        tests = load_jsonl(Path(args.data) / "test.jsonl")[: args.test_examples]
+    tests = load_jsonl(Path(args.data) / "test.jsonl")[: args.test_examples]
+    if tests:
+        if is_xla(device):  # every generated token has a new shape: generate on the CPU
+            model.to("cpu")
         hits = contained = 0
         for i, ex in enumerate(tests):
             pred = generate_answer(model, tokenizer, ex.question, ex.docs, ex.query)

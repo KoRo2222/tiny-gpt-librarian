@@ -21,7 +21,7 @@ import torch  # noqa: E402
 from webbot.data import load_token_file  # noqa: E402
 from webbot.model import GPT, GPTConfig, compile_model  # noqa: E402
 from webbot.tokenizer import BPETokenizer  # noqa: E402
-from webbot.train import PretrainConfig, load_checkpoint, pretrain  # noqa: E402
+from webbot.train import PretrainConfig, is_xla, load_checkpoint, pretrain, resolve_device  # noqa: E402
 
 PROMPTS = ["日本の首都は", "富士山\n富士山は", "人工知能\n人工知能(じんこうちのう)とは、"]
 
@@ -31,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--data", default="data/jawiki", help="directory with tokenizer.json, train.bin, val.bin")
     ap.add_argument("--out", required=True, help="directory for checkpoint.pt and train.log")
     ap.add_argument("--resume", action="store_true", help="continue from <out>/checkpoint.pt if present")
-    ap.add_argument("--device", default="auto", help="auto (cuda if available), cpu or cuda")
+    ap.add_argument("--device", default="auto", help="auto (CUDA, else a TPU via torch_xla, else CPU), cpu, cuda or xla")
     ap.add_argument("--compile", action="store_true", help="torch.compile the model")
     m = ap.add_argument_group("model (ignored when resuming: taken from the checkpoint)")
     m.add_argument("--d-model", type=int, default=512)
@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> list[dict]:
         log_file.write(line + "\n")
         log_file.flush()
 
-    device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
+    device = resolve_device(args.device)
     tokenizer = BPETokenizer.load(Path(args.data) / "tokenizer.json")
     resume = args.resume and ckpt_path.exists()
     if resume:
@@ -86,7 +86,7 @@ def main(argv: list[str] | None = None) -> list[dict]:
         )
     model_config.grad_checkpoint = args.grad_checkpoint
     model = GPT(model_config)
-    log(f"device {device}" + (f" ({torch.cuda.get_device_name()})" if device == "cuda" else "")
+    log(f"device {device}" + (f" ({torch.cuda.get_device_name()})" if device.type == "cuda" else "")
         + f", model {asdict(model_config)}")
     if args.compile:
         compile_model(model)
@@ -102,6 +102,9 @@ def main(argv: list[str] | None = None) -> list[dict]:
         config, device=device, checkpoint_path=ckpt_path, resume=resume, log=log,
     )
     if args.sample_tokens > 0:
+        if is_xla(device):  # every generated token has a new shape: generate on the CPU
+            device = torch.device("cpu")
+            model.to(device)
         model.eval()
         eot = tokenizer.special_tokens[tokenizer.EOT_TOKEN]
         for prompt in PROMPTS:

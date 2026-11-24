@@ -1,4 +1,5 @@
 from .checkpoint import load_checkpoint, load_model, save_checkpoint
+from .device import is_xla, resolve_device, to_cpu, xla_step
 from .distributed import all_reduce_gradients, broadcast_parameters, launch, local_rows, rank, world_size
 from .muon import Muon, make_muon_optimizer, newton_schulz
 from .precision import Precision, resolve_precision
@@ -13,6 +14,7 @@ __all__ = [
     "d2z_multiplier",
     "d2z_scheduler",
     "evaluate",
+    "is_xla",
     "launch",
     "local_rows",
     "load_checkpoint",
@@ -25,9 +27,12 @@ __all__ = [
     "pretrain",
     "PretrainConfig",
     "rank",
+    "resolve_device",
     "resolve_precision",
     "save_checkpoint",
+    "to_cpu",
     "train_step",
     "world_size",
+    "xla_step",
     "ZeroOptimizer",
 ]

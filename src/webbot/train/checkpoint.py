@@ -9,6 +9,8 @@ import torch
 
 from webbot.model import GPT, GPTConfig
 
+from .device import is_xla, to_cpu
+
 
 def save_checkpoint(path: str | Path, model: GPT, **state: Any) -> None:
     """Save the model (weights + config) plus any extra training state
@@ -20,12 +22,14 @@ def save_checkpoint(path: str | Path, model: GPT, **state: Any) -> None:
     for key, value in state.items():
         payload[key] = value.state_dict() if hasattr(value, "state_dict") else value
     tmp = path.with_name(path.name + ".tmp")
-    torch.save(payload, tmp)
+    torch.save(to_cpu(payload), tmp)  # device tensors (e.g. on a TPU) are saved from the CPU
     os.replace(tmp, path)
 
 
 def load_checkpoint(path: str | Path, device: str | torch.device = "cpu") -> dict:
-    return torch.load(path, map_location=device, weights_only=False)
+    # torch.load cannot map onto XLA devices; load_state_dict copies over.
+    location = "cpu" if is_xla(device) else device
+    return torch.load(path, map_location=location, weights_only=False)
 
 
 def load_model(path: str | Path, device: str | torch.device = "cpu") -> GPT:

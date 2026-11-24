@@ -110,3 +110,23 @@ def test_deadline_stops_cleanly_and_a_later_run_finishes(raw, tmp_path):
 def test_parse_shards():
     assert pipeline.parse_shards("0-3,7,21") == [0, 1, 2, 3, 7, 21]
     assert pipeline.parse_shards("5") == [5]
+
+
+def test_sft_limit_takes_only_the_first_questions(raw, tmp_path):
+    work = tmp_path / "work"
+    assert pipeline.main(_args(raw, work, tmp_path / "scratch", "--sft-limit", "10", "--test-examples", "1"))
+    kept = sum(len(load_jsonl(work / "sft" / f"{s}.jsonl")) for s in ("train", "val", "test"))
+    assert 0 < kept <= 10
+
+
+def test_kaggle_kernel_is_pinned_to_the_commit():
+    spec = importlib.util.spec_from_file_location("kaggle_submit", ROOT / "scripts" / "kaggle_submit.py")
+    submit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(submit)
+    code, meta = submit.kernel_files("abc1234", "someone", "webbot-pipeline", "TpuV5E8", cont=False)
+    assert 'COMMIT = "abc1234"' in code and "__COMMIT__" not in code
+    assert meta["id"] == "someone/webbot-pipeline" and meta["enable_tpu"] and not meta["enable_gpu"]
+    assert meta["enable_internet"] and meta["is_private"] and meta["kernel_sources"] == []
+    _, gpu = submit.kernel_files("abc1234", "someone", "webbot-pipeline", "NvidiaTeslaT4", cont=True)
+    assert gpu["enable_gpu"] and not gpu["enable_tpu"]
+    assert gpu["kernel_sources"] == ["someone/webbot-pipeline"]  # continue from the last output

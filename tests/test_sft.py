@@ -85,6 +85,17 @@ def test_batch_targets_are_next_written_tokens(tok):
     assert tgt.tolist() == [[IGNORE, 3, 4, IGNORE], [7, 8, IGNORE, IGNORE]]
 
 
+def test_padding_to_a_multiple_changes_only_the_width():
+    exs = [([1, 2, 3, 4, 5], [False, False, True, True, False]), ([6, 7, 8], [False, True, True])]
+    idx, tgt = make_batch(exs, pad_id=0)
+    idx8, tgt8 = make_batch(exs, pad_id=0, pad_multiple=8)
+    assert idx8.shape == (2, 8) and tgt8.shape == (2, 8)
+    assert torch.equal(idx8[:, :4], idx) and torch.equal(tgt8[:, :4], tgt)
+    # The longest row's last token becomes an input too; it has no target.
+    assert idx8[:, 4:].tolist() == [[5, 0, 0, 0], [0, 0, 0, 0]] and (tgt8[:, 4:] == IGNORE).all()
+    assert make_batch(exs, pad_id=0, pad_multiple=4)[0].shape == (2, 4)  # already a multiple
+
+
 def test_model_loss_is_the_mean_over_written_tokens():
     torch.manual_seed(0)
     model = GPT(GPTConfig(vocab_size=30, max_seq_len=16, d_model=16, n_layers=1, n_heads=2))
@@ -187,3 +198,13 @@ def test_exact_match_ignores_width_and_spaces():
     assert exact_match("Ｗａｔｔａ! Itta!", "Watta!Itta!")
     assert exact_match(" 3776 メートル\n", "３７７６メートル")
     assert not exact_match("3776メートル", "3776")
+
+
+def test_validation_loss_of_no_examples_is_nan(tok):
+    import math
+
+    from webbot.sft.train import evaluate_sft
+    from webbot.train import resolve_precision
+
+    model = _tiny_model(tok)
+    assert math.isnan(evaluate_sft(model, [], 0, 4, resolve_precision("cpu")))

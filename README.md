@@ -54,6 +54,9 @@ scripts/
   make_sft_data.py SFTデータを作る
   sft.py           SFT(--resume で中断した続きから)と、評価用の質問での完全一致
   run_pipeline.py  データ準備から評価までを1回で通す(済んだ段階は飛ばし、時間切れでも正常に終わる)
+  kaggle_submit.py Kaggleにパイプラインを提出して実行させる(TPU / GPU)
+kaggle/
+  pipeline_kernel.py  Kaggleで動く本体(コードの取得、PyTorch/XLAとRustの準備、小さな試運転、本番)
 notebooks/
   kaggle_pipeline.ipynb  Kaggleで全段階を自動で実行するノートブック(PCを閉じても進む)
   pretrain_colab.ipynb  Google Colab(GPU)で事前学習するノートブック
@@ -208,6 +211,7 @@ tests/             テスト
 - 区切りの特殊トークンはIDを直接入れ、質問や段落の文はふつうの文字としてエンコードします。Wikipediaの本文に `<|doc|>` のような文字列があっても、特殊トークンにはなりません。学習と推論は同じ関数で部分ごとにエンコードするので、トークンの切れ方がそろいます
 - 例は auto-wiki-qa の質問から作ります。検索語は当面、質問そのものです(BM25は質問文のままでもよく当たります)。段落は、質問でBM25を引いた上位3件(1件400字まで)です。推論のときも同じ検索器で引くので、学習と本番の条件がそろいます。答えの文字列が3件のどれかに含まれる質問だけを使い、段落から答えを抜き出す形に寄せます
 - 分割は記事単位です。評価用は、事前学習で検証用に取り分けた記事(約1%)の質問なので、事前学習でもSFTでも見ていない記事について、段落を読んで答えられるかを測れます。SFTの検証用は別の約1%の記事、残りが学習用です
+- TPUでも動きます(PyTorch/XLA)。`--device auto` はCUDA、なければTPU、なければCPUを選びます。XLAは計算をため込んで1つのグラフにまとめてから実行するので、1ステップの終わりにだけ同期し(損失の値を読むのも1回)、SFTのバッチ幅は128の倍数に切り上げてグラフの種類を減らします。形が1トークンごとに変わる生成はCPUに移して行い、チェックポイントはCPUに移してから保存します。混合精度はbf16です
 - 学習ループは事前学習と同じ部品(AdamW、D2Z、混合精度、勾配クリップ、勾配累積、チェックポイントと中断からの再開)を使い、長さの違う例をバッチの中で `<|pad|>` で詰めます。勾配累積では、損失はマイクロバッチごとの平均です
 - テストでは、損失をかけるトークンがちょうど検索と答えの部分になること、損失が「書く部分だけを1つずつ計算した参照」と一致すること、小さなモデルをSFTすると学習した質問に正しい答えを生成できるようになること(学習前は0問)、中断から再開したSFTが中断しなかった場合と一致すること、評価用の記事が事前学習で取り分けた記事とちょうど一致することを確かめています
 
@@ -449,7 +453,9 @@ python -m venv .venv
 
 Rust版をビルドしなくても、Python版だけで動きます(`backend="python"`)。ただし、Rust版のテストは失敗します。
 
-**Kaggleで全段階を自動で実行する**(おすすめ): Kaggleで [notebooks/kaggle_pipeline.ipynb](notebooks/kaggle_pipeline.ipynb) を読み込み、Accelerator を GPU(T4 x2 または P100)、Internet を On にして、「Save Version」→「Save & Run All (Commit)」で実行します。実行はKaggleのサーバーで続くので、ブラウザもPCも閉じてかまいません。`scripts/run_pipeline.py` がデータの準備(jawiki全22シャードのダウンロードを含む)→ 事前学習 → 検索の索引 → SFTデータ → SFTと評価を順に行い、結果はノートブックの Output に出ます。Kaggleの1回の上限(12時間)より前に学習を止めて正常に終わるので、続きは前回の出力を入力に追加して実行し直せば再開します。
+**KaggleのTPUで全段階を自動で実行する**: `python scripts/kaggle_submit.py` で、`kaggle/pipeline_kernel.py` を今のコミットに固定してKaggleに提出し、TPU v5e-8(の1チップ)で実行させます(Kaggle CLIと `~/.kaggle/kaggle.json` が必要です。コミットはGitHubにプッシュ済みである必要があります)。カーネルはまず全段階を小さな設定で数分ずつ試し、通ったら本番に入ります。途中で止まったら `--continue` を付けて提出し直すと、前回の出力から続きを再開します。`--accelerator NvidiaTeslaT4` でGPUでも動きます。
+
+**Kaggleのノートブックで全段階を自動で実行する**: Kaggleで [notebooks/kaggle_pipeline.ipynb](notebooks/kaggle_pipeline.ipynb) を読み込み、Accelerator を GPU(T4 x2 または P100)、Internet を On にして、「Save Version」→「Save & Run All (Commit)」で実行します。実行はKaggleのサーバーで続くので、ブラウザもPCも閉じてかまいません。`scripts/run_pipeline.py` がデータの準備(jawiki全22シャードのダウンロードを含む)→ 事前学習 → 検索の索引 → SFTデータ → SFTと評価を順に行い、結果はノートブックの Output に出ます。Kaggleの1回の上限(12時間)より前に学習を止めて正常に終わるので、続きは前回の出力を入力に追加して実行し直せば再開します。
 
 **Google Colabで事前学習する**: [notebooks/pretrain_colab.ipynb](https://colab.research.google.com/github/KoRo2222/tiny-gpt-librarian/blob/master/notebooks/pretrain_colab.ipynb) を開き、ランタイムを T4 GPU にして上から順に実行します。jawikiのダウンロードとデータの準備はColabの上で行い、トークン列のファイルとチェックポイントは Googleドライブ(`MyDrive/webbot/`)に保存します。接続が切れたら同じ手順で実行し直すと、チェックポイントの続きから再開します。最初に50ステップの試運転をして、1ステップの時間から学習全体の時間の見込みを表示します。
 

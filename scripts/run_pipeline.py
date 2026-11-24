@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--sft-warmup", type=int, default=100)
     s.add_argument("--sft-eval-interval", type=int, default=500)
     s.add_argument("--test-examples", type=int, default=878)
+    s.add_argument("--sft-limit", type=int, default=None, help="only the first N questions (quick trials)")
     return ap
 
 
@@ -194,8 +195,9 @@ class Pipeline:
         retrieval = self._linked_dir("jawiki_retrieval", [self.jawiki_shard(self.args.retrieval_shard)])
         if not self.run("index", ["scripts/build_index.py", "--raw", str(retrieval), "--out", str(index)]):
             return False
+        limit = ["--limit", str(self.args.sft_limit)] if self.args.sft_limit else []
         return self.run("SFT data", ["scripts/make_sft_data.py", "--index", str(index), "--qa", str(self.qa_dir()),
-                                     "--out", str(sft), "--workers", str(self.args.workers)])
+                                     "--out", str(sft), "--workers", str(self.args.workers), *limit])
 
     def sft(self) -> bool:
         out = self.work / "runs" / "sft"
