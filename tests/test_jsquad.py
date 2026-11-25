@@ -65,3 +65,38 @@ def test_evaluation_gives_the_paragraph_and_averages(monkeypatch):
     result = evaluate_jsquad(None, None, items)
     assert seen == [("q1", (Doc("梅雨", None, "本文1"),)), ("q2", (Doc("梅雨", None, "本文2"),))]
     assert result == {"exact_match": 0.5, "f1": 0.5, "contains_answer": 0.5}
+
+
+def test_jsquad_questions_become_sft_examples():
+    from webbot.eval import to_sft_examples
+    from webbot.sft import SFTExample
+
+    items = [JSQuADItem("1", "どこの現象？", "梅雨", "梅雨は東アジアの気象現象。", ("東アジア", "東アジアの気象"))]
+    assert to_sft_examples(items) == [
+        SFTExample("どこの現象？", "どこの現象？", (Doc("梅雨", None, "梅雨は東アジアの気象現象。"),), "東アジア", -1)
+    ]
+
+
+def test_add_jsquad_extends_only_the_training_split(tmp_path):
+    import importlib.util
+
+    from webbot.sft import SFTExample, load_jsonl, save_jsonl
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("add_jsquad", root / "scripts" / "add_jsquad.py")
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    sft = tmp_path / "sft"
+    sft.mkdir()
+    ex = SFTExample("q", "q", (Doc("t", None, "a"),), "a", 7)
+    for split, n in (("train", 3), ("val", 1), ("test", 2)):
+        save_jsonl([ex] * n, sft / f"{split}.jsonl")
+    data = {"data": [{"title": "梅雨", "paragraphs": [{"context": "梅雨 [SEP] 東アジアの現象。", "qas": [
+        {"id": f"q{i}", "question": f"問{i}", "answers": [{"text": "東アジア", "answer_start": 0}]} for i in range(4)]}]}]}
+    (tmp_path / "j.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    counts = script.main(["--sft", str(sft), "--jsquad", str(tmp_path / "j.json"), "--out", str(tmp_path / "out")])
+    assert counts == {"train_base": 3, "train_jsquad": 4, "train": 7}
+    train = load_jsonl(tmp_path / "out" / "train.jsonl")
+    assert train[:3] == [ex] * 3 and [e.question for e in train[3:]] == ["問0", "問1", "問2", "問3"]
+    for split in ("val", "test"):
+        assert load_jsonl(tmp_path / "out" / f"{split}.jsonl") == load_jsonl(sft / f"{split}.jsonl")

@@ -73,8 +73,9 @@ pipeline = f"{sys.executable} {CODE}/scripts/run_pipeline.py --scratch /tmp/webb
 
 # 4. every stage at toy size: the searched shard only, a few steps each
 smoke = (f"{pipeline} --work /tmp/smoke --shards 21 --train-tokens {32 * 1024 * 20} --warmup 5 --eval-interval 10 "
-         f"--sft-steps 20 --sft-warmup 5 --sft-eval-interval 10 --sft-limit 3000 --test-examples 5 --deadline-hours 1")
-smoke_ok = sh(smoke, check=False) == 0 and os.path.exists("/tmp/smoke/runs/sft/DONE")
+         f"--sft-steps 20 --sft-warmup 5 --sft-eval-interval 10 --sft-limit 3000 --test-examples 5 --deadline-hours 1 "
+         f"--jsquad --sft-jsquad-steps 20 --jsquad-eval-limit 10")
+smoke_ok = sh(smoke, check=False) == 0 and os.path.exists("/tmp/smoke/runs/sft_jsquad/jsquad.json")
 os.makedirs(f"{WORK}/smoke", exist_ok=True)
 for log in ("pipeline.log", "runs/base/train.log", "runs/sft/train.log"):
     if os.path.exists(f"/tmp/smoke/{log}"):
@@ -83,9 +84,11 @@ if not smoke_ok:
     sys.exit("the toy-size run failed: see the log above and smoke/ in the output")
 
 # 5. the real run, continuing a previous one attached as an input
-previous = [os.path.dirname(p) for p in glob.glob("/kaggle/input/**/pipeline.log", recursive=True)]
+# The shallowest pipeline.log is the run's own (smoke/pipeline.log is the toy run's).
+previous = sorted((os.path.dirname(p) for p in glob.glob("/kaggle/input/**/pipeline.log", recursive=True)),
+                  key=lambda d: d.count("/"))
 left = DEADLINE_HOURS - (time.monotonic() - START) / 3600
-cmd = f"{pipeline} --work {WORK} --deadline-hours {left:.2f}"
+cmd = f"{pipeline} --work {WORK} --deadline-hours {left:.2f} --jsquad"
 if previous:
     cmd += f" --resume-from {previous[0]}"
 sh(cmd, check=False)

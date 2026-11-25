@@ -59,6 +59,7 @@ scripts/
   ask.py           質問に答える(検索語・引いた段落・答えを表示)
   eval_e2e.py      検索から答えまでを通して評価する
   eval_jsquad.py   JSQuADで評価する
+  add_jsquad.py    JSQuADの学習用の問題をSFTデータに加える
   run_pipeline.py  データ準備から評価までを1回で通す(済んだ段階は飛ばし、時間切れでも正常に終わる)
   kaggle_submit.py Kaggleにパイプラインを提出して実行させる(TPU / GPU)
 kaggle/
@@ -476,6 +477,7 @@ tests/             テスト
 |---|---|---|---|
 | 36.5% | 50.8% | 47.5% | 0.10秒 |
 
+- JSQuADの学習用(62,697問)をSFTデータに加えて学習し直すこともできます(`scripts/add_jsquad.py`、`scripts/run_pipeline.py --jsquad`)。問題に付いている段落を1件だけ `<|doc|>` にし、1つ目の正解を答えにします。検証用・評価用はauto-wiki-qaのままなので、混ぜたことでauto-wiki-qaの成績が下がらないかも比べられます
 - auto-wiki-qaの評価用(完全一致54.3%)より大きく下がりました。人が書いた質問は、段落と言い回しが違うものや、「どこか」「何季か」のように答えの種類で絞り込む必要があるものが多く、段落の中の別の語句を抜き出す誤りが目立ちます(「日本で梅雨がないのは北海道とどこか。」に「雨季」、「梅雨とは何季の一種か?」に「5月から7月」)
 
 ## セットアップ
@@ -511,7 +513,7 @@ Rust版をビルドしなくても、Python版だけで動きます(`backend="py
 ```
 data/raw/jawiki/        hpprc/jawiki の data/train-*.parquet(1ファイル約0.4GB、全22ファイル)
 data/raw/auto-wiki-qa/  cl-nagoya/auto-wiki-qa の data/train-*.parquet(全4ファイル、記事ID順)
-data/raw/jsquad/        JGLUE の datasets/jsquad-v1.3/valid-v1.3.json
+data/raw/jsquad/        JGLUE の datasets/jsquad-v1.3/{train,valid}-v1.3.json
 
 .venv\Scripts\python scripts\prepare_data.py     # data/jawiki/ に tokenizer.json, train.bin, val.bin
 .venv\Scripts\python scripts\build_index.py      # data/index/ に検索索引

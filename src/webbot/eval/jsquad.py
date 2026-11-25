@@ -79,3 +79,14 @@ def evaluate_jsquad(
         if log is not None and i < 8:
             log(f"Q: {item.question} | gold: {' / '.join(item.answers)} | pred: {pred}")
     return {k: totals[k] / len(items) for k in ("exact_match", "f1", "contains_answer")} if items else {}
+
+
+def to_sft_examples(items: Sequence[JSQuADItem]) -> list:
+    """JSQuAD questions as SFT examples in the same layout as the
+    auto-wiki-qa ones: the question is the search query, the question's own
+    paragraph the one document (as in evaluate_jsquad), the first reference
+    the answer. JSQuAD has no article ids: article_id is -1."""
+    from webbot.sft.data import SFTExample
+
+    return [SFTExample(it.question, it.question, (Doc(it.title, None, it.text),), it.answers[0], -1)
+            for it in items]

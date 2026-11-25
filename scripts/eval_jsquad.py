@@ -7,6 +7,7 @@ its paragraph as the only document.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,7 @@ def main(argv: list[str] | None = None) -> dict:
     ap.add_argument("--data", default="data/raw/jsquad/valid-v1.3.json")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--out-json", default=None, help="also write the scores here")
     args = ap.parse_args(argv)
     torch.set_num_threads(args.threads)
     model, tok = load_model(args.model), BPETokenizer.load(args.tokenizer)
@@ -36,6 +38,8 @@ def main(argv: list[str] | None = None) -> dict:
     result = evaluate_jsquad(model, tok, items, log=lambda s: print(s, flush=True))
     print(", ".join(f"{k} {v:.1%}" for k, v in result.items())
           + f" ({(time.perf_counter() - t) / max(len(items), 1):.2f} s/question)", flush=True)
+    if args.out_json:
+        Path(args.out_json).write_text(json.dumps({**result, "questions": len(items)}, indent=1), encoding="utf-8")
     return result
 
 

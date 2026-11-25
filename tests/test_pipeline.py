@@ -130,3 +130,39 @@ def test_kaggle_kernel_is_pinned_to_the_commit():
     _, gpu = submit.kernel_files("abc1234", "someone", "webbot-pipeline", "NvidiaTeslaT4", cont=True)
     assert gpu["enable_gpu"] and not gpu["enable_tpu"]
     assert gpu["kernel_sources"] == ["someone/webbot-pipeline"]  # continue from the last output
+
+
+def _jsquad_files(root):
+    """Tiny JSQuAD train/dev files about the same made-up articles."""
+    import json
+
+    root.mkdir(exist_ok=True)
+    for name, ns in (("train-v1.3.json", range(0, 6)), ("valid-v1.3.json", range(6, 9))):
+        paragraphs = [{"context": f"品{n}号 [SEP] 品{n}号の色は{COLORS[n % len(COLORS)]}である。",
+                       "qas": [{"id": f"{name}{n}", "question": f"品{n}号は何色？",
+                                "answers": [{"text": COLORS[n % len(COLORS)], "answer_start": 0}]}]} for n in ns]
+        (root / name).write_text(json.dumps({"data": [{"title": "品", "paragraphs": paragraphs}]}, ensure_ascii=False),
+                                 encoding="utf-8")
+    return root
+
+
+def test_jsquad_stages(raw, tmp_path):
+    import json
+
+    work = tmp_path / "work"
+    extra = ["--jsquad", "--jsquad-raw", str(_jsquad_files(tmp_path / "jsquad")), "--sft-jsquad-steps", "6"]
+    assert pipeline.main(_args(raw, work, tmp_path / "scratch", *extra))
+    train = load_jsonl(work / "sft_jsquad" / "train.jsonl")
+    assert sum(ex.article_id == -1 for ex in train) == 6  # the JSQuAD questions
+    assert (work / "runs" / "sft_jsquad" / "DONE").exists()
+    # It trained on the combined data (the log counts its training questions).
+    log = (work / "runs" / "sft_jsquad" / "train.log").read_text(encoding="utf-8")
+    assert f"SFT: {len(train):,} train" in log
+    for name in ("sft", "sft_jsquad"):
+        scores = json.loads((work / "runs" / name / "jsquad.json").read_text(encoding="utf-8"))
+        assert scores["questions"] == 3 and 0 <= scores["f1"] <= 1
+    assert pipeline.main(_args(raw, work, tmp_path / "scratch", *extra))
+    log = (work / "pipeline.log").read_text(encoding="utf-8").split("all stages done")[1]
+    for stage in ("SFT data with JSQuAD: already made", "SFT (sft_jsquad): already done",
+                  "JSQuAD eval of sft: already done", "JSQuAD eval of sft_jsquad: already done"):
+        assert stage in log

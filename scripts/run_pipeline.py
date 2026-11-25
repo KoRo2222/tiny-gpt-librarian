@@ -6,6 +6,10 @@ commit, which keeps running with the browser closed):
     3. build the BM25 index (one shard)   -> <scratch>/index
     4. make the SFT data                  -> <work>/sft
     5. fine-tune and answer the test set  -> <work>/runs/sft
+    with --jsquad, also:
+    6. add JSQuAD's training questions   -> <work>/sft_jsquad
+    7. fine-tune on that, from the base   -> <work>/runs/sft_jsquad
+    8. score both on JSQuAD dev           -> <work>/runs/{sft,sft_jsquad}/jsquad.json
 
 <work> keeps what is worth saving (token files, checkpoints, logs); raw
 downloads go to <scratch>. Each stage is skipped when its output already
@@ -28,6 +32,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 N_JAWIKI_SHARDS = 22
+JGLUE = "https://raw.githubusercontent.com/yahoojapan/JGLUE/main/datasets/jsquad-v1.3"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,6 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--sft-eval-interval", type=int, default=500)
     s.add_argument("--test-examples", type=int, default=878)
     s.add_argument("--sft-limit", type=int, default=None, help="only the first N questions (quick trials)")
+    j = ap.add_argument_group("JSQuAD (with --jsquad)")
+    j.add_argument("--jsquad", action="store_true",
+                   help="also fine-tune with JSQuAD's training questions added, and score both models on JSQuAD dev")
+    j.add_argument("--jsquad-raw", default=None, help="directory with train-v1.3.json and valid-v1.3.json")
+    j.add_argument("--sft-jsquad-steps", type=int, default=8000)
+    j.add_argument("--jsquad-eval-limit", type=int, default=None)
     return ap
 
 
@@ -199,16 +210,17 @@ class Pipeline:
         return self.run("SFT data", ["scripts/make_sft_data.py", "--index", str(index), "--qa", str(self.qa_dir()),
                                      "--out", str(sft), "--workers", str(self.args.workers), *limit])
 
-    def sft(self) -> bool:
-        out = self.work / "runs" / "sft"
+    def sft(self, name: str = "sft", data: str = "sft", steps: int | None = None) -> bool:
+        out = self.work / "runs" / name
+        label = "SFT" if name == "sft" else f"SFT ({name})"
         if (out / "DONE").exists():
-            self.log("SFT: already done")
+            self.log(f"{label}: already done")
             return True
         a = self.args
-        ok = self.run("SFT", [
+        ok = self.run(label, [
             "scripts/sft.py", "--init", str(self.work / "runs" / "base" / "checkpoint.pt"),
-            "--tokenizer", str(self.work / "data" / "tokenizer.json"), "--data", str(self.work / "sft"),
-            "--out", str(out), "--resume", "--steps", str(a.sft_steps), "--batch-size", str(a.sft_batch_size),
+            "--tokenizer", str(self.work / "data" / "tokenizer.json"), "--data", str(self.work / data),
+            "--out", str(out), "--resume", "--steps", str(steps or a.sft_steps), "--batch-size", str(a.sft_batch_size),
             "--grad-accum", str(a.sft_grad_accum), "--lr", str(a.sft_lr), "--warmup", str(a.sft_warmup),
             "--eval-interval", str(a.sft_eval_interval), "--test-examples", str(a.test_examples),
             "--device", a.device,
@@ -217,9 +229,52 @@ class Pipeline:
             (out / "DONE").write_text("done\n")
         return ok
 
+    def jsquad_file(self, name: str) -> Path:
+        if self.args.jsquad_raw:
+            return Path(self.args.jsquad_raw) / name
+        target = self.scratch / "jsquad" / name
+        if not target.exists():
+            import urllib.request
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(f"{JGLUE}/{name}", target)
+            self.log(f"downloaded {name}")
+        return target
+
+    def sft_jsquad_data(self) -> bool:
+        out = self.work / "sft_jsquad"
+        if (out / "test.jsonl").exists():
+            self.log("SFT data with JSQuAD: already made")
+            return True
+        return self.run("SFT data with JSQuAD", ["scripts/add_jsquad.py", "--sft", str(self.work / "sft"),
+                                                 "--jsquad", str(self.jsquad_file("train-v1.3.json")),
+                                                 "--out", str(out)])
+
+    def sft_jsquad(self) -> bool:
+        return self.sft(name="sft_jsquad", data="sft_jsquad", steps=self.args.sft_jsquad_steps)
+
+    def jsquad_eval(self) -> bool:
+        for name in ("sft", "sft_jsquad"):
+            out = self.work / "runs" / name / "jsquad.json"
+            if out.exists():
+                self.log(f"JSQuAD eval of {name}: already done")
+                continue
+            limit = ["--limit", str(self.args.jsquad_eval_limit)] if self.args.jsquad_eval_limit else []
+            if not self.run(f"JSQuAD eval of {name}", [
+                "scripts/eval_jsquad.py", "--model", str(self.work / "runs" / name / "checkpoint.pt"),
+                "--tokenizer", str(self.work / "data" / "tokenizer.json"),
+                "--data", str(self.jsquad_file("valid-v1.3.json")), "--out-json", str(out),
+                "--threads", str(min(self.args.workers, 32)), *limit,
+            ]):
+                return False
+        return True
+
     def __call__(self) -> bool:
         self.resume()
-        for stage in (self.prepare, self.pretrain, self.sft_data, self.sft):
+        stages = [self.prepare, self.pretrain, self.sft_data, self.sft]
+        if self.args.jsquad:
+            stages += [self.sft_jsquad_data, self.sft_jsquad, self.jsquad_eval]
+        for stage in stages:
             if not stage():
                 self.log("unfinished: run again with --resume-from <this run's output> to continue")
                 return False
