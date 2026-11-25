@@ -44,6 +44,8 @@ src/webbot/sft/
   infer.py         段落を与えて答えを生成、答えの完全一致判定
   agent.py         推論ループ(モデルが検索語を書く→BM25で検索→段落を読んで答える)と、その評価
   build.py         SFTデータのファイルを作る(検索は複数プロセス)
+src/webbot/eval/
+  jsquad.py        JSQuAD(人が書いた読解問題)での評価(完全一致、文字単位のF1)
 src/webbot/retrieval/
   bm25.py          BM25の転置索引と検索(文字bigram / BPEトークン)
   paragraphs.py    段落の検索と、auto-wiki-qaによる検索の評価
@@ -56,6 +58,7 @@ scripts/
   sft.py           SFT(--resume で中断した続きから)と、評価用の質問での完全一致
   ask.py           質問に答える(検索語・引いた段落・答えを表示)
   eval_e2e.py      検索から答えまでを通して評価する
+  eval_jsquad.py   JSQuADで評価する
   run_pipeline.py  データ準備から評価までを1回で通す(済んだ段階は飛ばし、時間切れでも正常に終わる)
   kaggle_submit.py Kaggleにパイプラインを提出して実行させる(TPU / GPU)
 kaggle/
@@ -467,7 +470,13 @@ tests/             テスト
 - モデルは検索語として質問を書き写すように学習しましたが、16%の質問では書き写しが崩れます(珍しい漢字が別の文字になるなど。「阿久澤 騰」→「阿久澤 岩メ」)。そのぶん段落の当たり率が1.2ポイント下がり、正答率は質問をそのまま使う場合をわずかに下回りました。今のところ、モデルに検索語を書かせる利点は出ていません(SFTデータの検索語が質問そのものなので、当然の結果でもあります)
 - 検索の対象は1シャード(6.4万記事)だけなので、それ以外の記事についての質問(例: 「富士山の高さは？」)には答えられません
 
-JSQuAD(人が書いた質問)での評価はこれから行います。
+**JSQuAD**(`scripts/eval_jsquad.py`): JGLUEのJSQuAD v1.3 の検証用(59記事・4,442問、CC BY-SA 4.0)で、問題に付いている段落を1件だけ `<|doc|>` として与えて答えさせました。JSQuADでは学習していません(auto-wiki-qaでのSFTのまま)。採点はSQuADと同じ形で、全角・半角と空白の違いを無視し、複数ある正解のうち一番近いものと比べます。
+
+| 完全一致 | 文字単位のF1 | 答えを含む | 1問あたり |
+|---|---|---|---|
+| 36.5% | 50.8% | 47.5% | 0.10秒 |
+
+- auto-wiki-qaの評価用(完全一致54.3%)より大きく下がりました。人が書いた質問は、段落と言い回しが違うものや、「どこか」「何季か」のように答えの種類で絞り込む必要があるものが多く、段落の中の別の語句を抜き出す誤りが目立ちます(「日本で梅雨がないのは北海道とどこか。」に「雨季」、「梅雨とは何季の一種か?」に「5月から7月」)
 
 ## セットアップ
 
@@ -502,6 +511,7 @@ Rust版をビルドしなくても、Python版だけで動きます(`backend="py
 ```
 data/raw/jawiki/        hpprc/jawiki の data/train-*.parquet(1ファイル約0.4GB、全22ファイル)
 data/raw/auto-wiki-qa/  cl-nagoya/auto-wiki-qa の data/train-*.parquet(全4ファイル、記事ID順)
+data/raw/jsquad/        JGLUE の datasets/jsquad-v1.3/valid-v1.3.json
 
 .venv\Scripts\python scripts\prepare_data.py     # data/jawiki/ に tokenizer.json, train.bin, val.bin
 .venv\Scripts\python scripts\build_index.py      # data/index/ に検索索引
